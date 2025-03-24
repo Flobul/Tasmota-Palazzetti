@@ -765,9 +765,9 @@ void Palazzetti::iGetFanLimits()
     if (byte_471CC2)
     {
         if (byte_471CC2 < _PWR)
-            _FAN1LMIN = _PWR - byte_471CC2;
+            _FAN2LMIN = _PWR - byte_471CC2;
         else
-            _FAN1LMIN = 0;
+            _FAN2LMIN = 0;
     }
 }
 
@@ -1088,24 +1088,24 @@ Palazzetti::CommandResult Palazzetti::iGetStoveConfigurationAtech()
     if (_PARAMS[0x69] != 0 && _PARAMS[0x69] < 6)
         byte_471CC2 = _PARAMS[0x69];
 
-    _FAN1LMIN = 1;
-    _FAN1LMAX = 5;
-    _FAN2LMIN = 0;
-    _FAN2LMAX = 1;
+    _FAN2LMIN = 1;
+    _FAN2LMAX = 5;
     _FAN3LMIN = 0;
     _FAN3LMAX = 1;
+    _FAN4LMIN = 0;
+    _FAN4LMAX = 1;
     _FAN2MODE = 1;
 
     if (_HPARAMS[0x26 / 2] & 0x10)
-        _FAN1LMIN = 0;
+        _FAN2LMIN = 0;
 
     if (((_HPARAMS[0x38 / 2] + ((bVar1 - 1) * 2)) & 0x800) == 0)
         _FAN2MODE = 3;
 
     if (_FAN2TYPE == 5 || _FAN2TYPE == 3)
     {
-        _FAN2LMAX = 5;
         _FAN3LMAX = 5;
+        _FAN4LMAX = 5;
     }
 
     byte tmp = 1; // local_37
@@ -2041,12 +2041,12 @@ Palazzetti::CommandResult Palazzetti::getAllStatus(bool refreshStatus, int *MBTY
     iGetFanLimits();
     if (FANLMINMAX)
     {
-        (*FANLMINMAX)[0] = _FAN1LMIN;
-        (*FANLMINMAX)[1] = _FAN1LMAX;
-        (*FANLMINMAX)[2] = _FAN2LMIN;
-        (*FANLMINMAX)[3] = _FAN2LMAX;
-        (*FANLMINMAX)[4] = _FAN3LMIN;
-        (*FANLMINMAX)[5] = _FAN3LMAX;
+        (*FANLMINMAX)[0] = _FAN2LMIN;
+        (*FANLMINMAX)[1] = _FAN2LMAX;
+        (*FANLMINMAX)[2] = _FAN3LMIN;
+        (*FANLMINMAX)[3] = _FAN3LMAX;
+        (*FANLMINMAX)[4] = _FAN4LMIN;
+        (*FANLMINMAX)[5] = _FAN4LMAX;
     }
     if (F2V)
         *F2V = _F2V;
@@ -2813,12 +2813,12 @@ Palazzetti::CommandResult Palazzetti::setPower(byte powerLevel, byte *PWRReturn,
 
     if (FANLMINMAXReturn)
     {
-        (*FANLMINMAXReturn)[0] = _FAN1LMIN;
-        (*FANLMINMAXReturn)[1] = _FAN1LMAX;
-        (*FANLMINMAXReturn)[2] = _FAN2LMIN;
-        (*FANLMINMAXReturn)[3] = _FAN2LMAX;
-        (*FANLMINMAXReturn)[4] = _FAN3LMIN;
-        (*FANLMINMAXReturn)[5] = _FAN3LMAX;
+        (*FANLMINMAXReturn)[0] = _FAN2LMIN;
+        (*FANLMINMAXReturn)[1] = _FAN2LMAX;
+        (*FANLMINMAXReturn)[2] = _FAN3LMIN;
+        (*FANLMINMAXReturn)[3] = _FAN3LMAX;
+        (*FANLMINMAXReturn)[4] = _FAN4LMIN;
+        (*FANLMINMAXReturn)[5] = _FAN4LMAX;
     }
 
     return CommandResult::OK;

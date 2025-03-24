@@ -58,6 +58,7 @@
 #define D_AS "comme"
 #define D_AT "at"
 #define D_AUTO "AUTO"
+#define D_AUTO_UPDATE "Auto Update"
 #define D_BATTERY "Battery"
 #define D_BATT "Batt"                // Short for Battery
 #define D_BATTERY_CHARGE "Charge"    // Battery charge in %
@@ -88,6 +89,7 @@
 #define D_DEBUG "Debug"
 #define D_DEWPOINT "Point de rosée"
 #define D_DISABLED "Désactivé"
+#define D_DISCONNECTED "Disconnected"
 #define D_DISTANCE "Distance"
 #define D_DNS_SERVER "Serveur DNS"
 #define D_DO "Oxygène dissout"
@@ -739,6 +741,7 @@
 #define D_SENSOR_SPI_MISO      "SPI MISO"
 #define D_SENSOR_SPI_MOSI      "SPI MOSI"
 #define D_SENSOR_SPI_CLK       "SPI Clk"
+#define D_SENSOR_SDIO_CMD      "SDIO Cmd"
 #define D_GPIO_TS_SPI_CS       "TS SPI CS"
 #define D_GPIO_TS_RST          "TS RST"
 #define D_GPIO_TS_IRQ          "TS IRQ"
@@ -775,6 +778,8 @@
 #define D_SENSOR_SDM630_RX     "SDM630 Rx"
 #define D_SENSOR_WE517_TX      "WE517 Tx"
 #define D_SENSOR_WE517_RX      "WE517 Rx"
+#define D_SENSOR_LD2402_TX     "LD2402 Tx"
+#define D_SENSOR_LD2402_RX     "LD2402 Rx"
 #define D_SENSOR_LD2410_TX     "LD2410 Tx"
 #define D_SENSOR_LD2410_RX     "LD2410 Rx"
 #define D_SENSOR_LD2410S_TX     "LD2410S Tx"
@@ -1013,12 +1018,18 @@
 #define D_SENSOR_ME007_RX      "ME007 Rx"
 #define D_SENSOR_TUYAMCUBR_TX  "TuyaMCUBr Tx"
 #define D_SENSOR_TUYAMCUBR_RX  "TuyaMCUBr Rx"
+#define D_SENSOR_TWAI_TX       "TWAI Tx"
+#define D_SENSOR_TWAI_RX       "TWAI Rx"
+#define D_SENSOR_TWAI_BO       "TWAI BusOff"
+#define D_SENSOR_TWAI_CLK      "TWAI ClkOut"
 #define D_SENSOR_BIOPDU_PZEM0XX_TX "BioPDU PZEM0XX Tx"
 #define D_SENSOR_BIOPDU_PZEM016_RX "BioPDU PZEM016 Rx"
 #define D_SENSOR_BIOPDU_BIT    "BioPDU Bit"
 #define D_SENSOR_LOX_O2_RX     "LoxO2 RX"
 #define D_GPIO_MAGIC_SWITCH    "MagicSwitch"
 #define D_SENSOR_WOOLIIS_RX    "Wooliis Rx"
+#define D_SENSOR_C8_CO2_5K_RX  "C8-CO2-5K Rx"
+#define D_SENSOR_C8_CO2_5K_TX  "C8-CO2-5K Tx"
 
 
 // Units
@@ -1215,6 +1226,13 @@
 #define D_FP_PASSVERIFY "Mot-de-passe vérifié" // 0x21 Verify the fingerprint passed
 #define D_FP_UNKNOWNERROR "Erreur"             // Any other error
 
+// xsns_90_hrg15.ino
+#define D_HRG_VALID "Valid"
+#define D_HRG_ACTIVE "Active"
+#define D_HRG_EVENT "Event"
+#define D_HRG_TOTAL "Total"
+#define D_HRG_FLOWRATE "Flow Rate"
+
 // xsns_96_flowratemeter.ino
 #define D_FLOWRATEMETER_NAME "Débit"
 #define D_FLOWRATEMETER_AMOUNT_TODAY "Quantité aujourd'hui"
@@ -1303,5 +1321,9 @@
 #define D_EXPORT                          "Export"
 #define D_CHARGING                        "En charge"
 #define D_CAPACITY                        "Capacité"
+
+// xnrg_25_v9240.ino
+#define D_SENSOR_V9240_TX "V9240 TX"
+#define D_SENSOR_V9240_RX "V9240 RX"
 
 #endif  // _LANGUAGE_FR_FR_H_

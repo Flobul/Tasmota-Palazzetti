@@ -823,7 +823,7 @@ constexpr uint32_t feature[] = {
   0x00000020 |  // xdrv_88_esp32_shelly_pro.ino
 #endif
 #ifdef USE_DALI
-  0x00000040 |  // xdrv_89_esp32_dali.ino
+  0x00000040 |  // xdrv_75_dali.ino
 #endif
 #if defined(USE_LIGHT) && defined(USE_BP1658CJ)
   0x00000080 |  // xlgt_10_bp1658cj.ino
@@ -931,15 +931,27 @@ constexpr uint32_t feature[] = {
 #if defined(USE_I2C) && defined(USE_RTC_CHIPS) && defined(USE_RX8010)
   0x00000200 |  // xdrv_56_rtc_chips.ino
 #endif
-#if defined(USE_PALAZZETTI)
-  0x00000400 |  // xdrv_74_palazzetti.ino
+#if defined(USE_I2C) && defined(USE_RTC_CHIPS) && defined(USE_PCF85063)
+  0x00000400 |  // xdrv_56_rtc_chips.ino
 #endif
-//  0x00000400 |  // 
-//  0x00000800 |  // 
-//  0x00001000 |  // 
-//  0x00002000 |  // 
-//  0x00004000 |  // 
-//  0x00008000 |  // 
+#ifdef USE_ESP32_TWAI
+  0x00000800 |  // xdrv_91_esp32_twai.ino
+#endif
+#ifdef USE_C8_CO2_5K
+  0x00001000 |  // xsns_117_c8_co2_5k.ino
+#endif
+#ifdef USE_WIZMOTE
+  0x00002000 |  // xdrv_77_wizmote.ino
+#endif
+#if defined(USE_ENERGY_SENSOR) && defined(USE_V9240)
+  0x00004000 |  // xnrg_25_v9240.ino
+#endif
+#ifdef USE_TELNET
+  0x00008000 |  // xdrv_80_telnet.ino
+#endif
+#ifdef USE_PALAZZETTI
+  0x00010000 |  // xdrv_100_palazzetti.ino
+#endif
 //  0x00010000 |  // 
 //  0x00020000 |  // 
 //  0x00040000 |  // 

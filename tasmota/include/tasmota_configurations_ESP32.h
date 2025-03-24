@@ -183,8 +183,6 @@
 
 #define USE_TLS
 #define USE_WEBSERVER
-#define USE_WEBCLIENT
-#define USE_WEBCLIENT_HTTPS
 
 #undef USE_ESP32_WDT                                  // disable watchdog on SAFEBOOT until more testing is done
 
@@ -211,7 +209,8 @@
 #endif
 
 #define USE_WEBCAM
-#define ENABLE_RTSPSERVER
+  #define USE_WEBCAM_V2
+  #define ENABLE_RTSPSERVER
 #define USE_SPI
 #define USE_SDCARD
 
@@ -300,8 +299,6 @@
 #undef USE_DOMOTICZ
 #undef USE_HOME_ASSISTANT
 #define USE_TASMOTA_DISCOVERY                    // Enable Tasmota Discovery support (+2k code)
-
-#define USE_WEBCLIENT_HTTPS
 
 #define USE_I2S
 #define USE_SPI
@@ -507,8 +504,6 @@
 #undef USE_DOMOTICZ
 #undef USE_HOME_ASSISTANT
 #define USE_TASMOTA_DISCOVERY                    // Enable Tasmota Discovery support (+2k code)
-
-#define USE_WEBCLIENT_HTTPS
 
 #define USE_ZIGBEE
 #define USE_TCP_BRIDGE
@@ -768,6 +763,7 @@
 #define USE_SONOFF_SPM                           // Add support for ESP32 based Sonoff Smart Stackable Power Meter (+11k code)
 #define USE_MODBUS_ENERGY                        // Add support for generic modbus energy monitor using a user file in rule space (+5k code)
 //#define USE_BIOPDU                               // Add support for BioPDU 625x12 6-channel energy monitor
+#define USE_BL0906                               // Add support for BL0906 up to 6 channel Energy monitor as used in Athom EM2/EM6
 
 #define USE_DHT                                  // Add support for DHT11, AM2301 (DHT21, DHT22, AM2302, AM2321) and SI7021 Temperature and Humidity sensor
 #define USE_MAX31855                             // Add support for MAX31855 K-Type thermocouple sensor using softSPI
@@ -797,14 +793,15 @@
 #define USE_DISPLAY_TM1621_SONOFF                // Add support for TM1621 display driver used by Sonoff POWR3xxD and THR3xxD
 #define USE_LOX_O2                               // Add support for LuminOx LOX O2 Sensor (+0k8 code)
 
-#ifndef USE_PALAZZETTI
-#define USE_PALAZZETTI                                  // Enable PALAZZETTI
-#endif
-
 #ifndef USE_KNX
 #define USE_KNX                                  // Enable KNX IP Protocol Support (+23k code, +3k3 mem)
 #endif
 #define USE_DALI                                 // Add support for DALI gateway (+5k code)
+#define USE_ESP32_TWAI                           // Add support for TWAI/CAN interface (+7k code)
+
+#ifndef USE_PALAZZETTI
+#define USE_PALAZZETTI                           // Enable PALAZZETTI
+#endif
 
 #endif // FIRMWARE_TASMOTA32
 

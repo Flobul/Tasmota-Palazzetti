@@ -433,7 +433,7 @@ const char HTTP_COUNTER[] PROGMEM =
   "<br><div id='t' style='text-align:center;'></div>";
 
 const char HTTP_END[] PROGMEM =
-  "<div style='text-align:right;font-size:11px;'><hr/><a href='https://bit.ly/tasmota' target='_blank' style='color:#aaa;'>Tasmota %s %s " D_BY " Theo Arends</a></div>"
+  "<div style='text-align:right;font-size:11px;'><hr/><a href='https://github.com/arendst/Tasmota' target='_blank' style='color:#aaa;'>Tasmota %s %s " D_BY " Theo Arends</a></div>"
   "</div>"
   "</body>"
   "</html>";
@@ -985,11 +985,12 @@ void WSContentSendStyle_P(const char* formatP, ...) {
   WebColor(COL_TEXT_WARNING),
 #endif
   WebColor(COL_TITLE),
-  (Web.initial_config) ? "" : (Settings->flag5.gui_module_name) ? "" : ModuleName().c_str(), SettingsTextEscaped(SET_DEVICENAME).c_str());
+  (Web.initial_config) ? "" : (Settings->flag5.gui_module_name) ? "" : ModuleName().c_str(),  // SetOption141 - (GUI) Disable display of GUI module name (1)
+  (Settings->flag6.gui_device_name) ? "" : SettingsTextEscaped(SET_DEVICENAME).c_str());      // SetOption163 - (GUI) Disable display of GUI device name (1)
 
   // SetOption53 - Show hostname and IP address in GUI main menu
 #if (RESTART_AFTER_INITIAL_WIFI_CONFIG)
-  if (Settings->flag3.gui_hostname_ip) {               // SetOption53  - (GUI) Show hostname and IP address in GUI main menu
+  if (Settings->flag3.gui_hostname_ip) {            // SetOption53 - (GUI) Show hostname and IP address in GUI main menu
 #else
   if ( Settings->flag3.gui_hostname_ip || ( (WiFi.getMode() == WIFI_AP_STA) && (!Web.initial_config) )  ) {
 #endif
@@ -1885,22 +1886,21 @@ bool HandleRootStatusRefresh(void) {
   XsnsXdrvCall(FUNC_WEB_SENSOR);
   WSContentSend_P(PSTR("</table>"));
 
-  if (!Settings->flag6.gui_no_state_text &&  // SetOption161 - (GUI) Disable display of state text (1)
-      TasmotaGlobal.devices_present) {
-
-#ifdef USE_SONOFF_IFAN
-    if (IsModuleIfan()) {
+  if (!Settings->flag6.gui_no_state_text) {          // SetOption161 - (GUI) Disable display of state text (1)
+    if (!Web.buttons_non_light_non_shutter) {        // Might still be zero on restart so chk if we have at least one 
+      WebGetDeviceCounts();
+    }
+    if ((Web.buttons_non_light_non_shutter > 0) &&
+       ( Web.buttons_non_light_non_shutter <= 8)) {  // We need at least one non light AND non shutter button
       WSContentSend_P(PSTR("{t}<tr>"));
-      WSContentSend_P(HTTP_DEVICE_STATE, 36, (bitRead(TasmotaGlobal.power, 0)) ? PSTR("bold") : PSTR("normal"), 54, GetStateText(bitRead(TasmotaGlobal.power, 0)));
-      uint32_t fanspeed = GetFanspeed();
-      snprintf_P(svalue, sizeof(svalue), PSTR("%d"), fanspeed);
-      WSContentSend_P(HTTP_DEVICE_STATE, 64, (fanspeed) ? PSTR("bold") : PSTR("normal"), 54, (fanspeed) ? svalue : GetStateText(0));
-      WSContentSend_P(PSTR("</tr></table>"));
-    } else {
+#ifdef USE_SONOFF_IFAN
+      if (IsModuleIfan()) {
+        WSContentSend_P(HTTP_DEVICE_STATE, 36, (bitRead(TasmotaGlobal.power, 0)) ? PSTR("bold") : PSTR("normal"), 54, GetStateText(bitRead(TasmotaGlobal.power, 0)));
+        uint32_t fanspeed = GetFanspeed();
+        snprintf_P(svalue, sizeof(svalue), PSTR("%d"), fanspeed);
+        WSContentSend_P(HTTP_DEVICE_STATE, 64, (fanspeed) ? PSTR("bold") : PSTR("normal"), 54, (fanspeed) ? svalue : GetStateText(0));
+      } else {
 #endif  // USE_SONOFF_IFAN
-
-      if (Web.buttons_non_light_non_shutter <= 8) {   // Any non light AND non shutter button
-        WSContentSend_P(PSTR("{t}<tr>"));
         uint32_t cols = Web.buttons_non_light_non_shutter;
         uint32_t fontsize = (cols < 5) ? 70 - (cols * 8) : 32;
         uint32_t button_ptr = 0;
@@ -1908,17 +1908,15 @@ bool HandleRootStatusRefresh(void) {
           if (bitRead(Web.light_shutter_button_mask, button_idx -1)) { continue; }  // Skip non-sequential shutter button
           bool power_state = bitRead(TasmotaGlobal.power, button_idx -1);
           snprintf_P(svalue, sizeof(svalue), PSTR("%d"), power_state);
-          WSContentSend_P(HTTP_DEVICE_STATE, 100 / cols, (power_state) ? "bold" : "normal", fontsize, (cols < 5) ? GetStateText(power_state) : svalue);
+          WSContentSend_P(HTTP_DEVICE_STATE, 100 / cols, (power_state) ? PSTR("bold") : PSTR("normal"), fontsize, (cols < 5) ? GetStateText(power_state) : svalue);
           button_ptr++;
-          if (button_ptr == Web.buttons_non_light_non_shutter) { break; }
+          if (button_ptr >= Web.buttons_non_light_non_shutter) { break; }
         }
-        WSContentSend_P(PSTR("</tr></table>"));
-      }
-
 #ifdef USE_SONOFF_IFAN
-    }
+      }
 #endif  // USE_SONOFF_IFAN
-
+      WSContentSend_P(PSTR("</tr></table>"));
+    }
   }
 
   if (1 == Web.slider_update_time) {
