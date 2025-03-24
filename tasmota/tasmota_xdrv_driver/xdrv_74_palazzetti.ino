@@ -24,10 +24,12 @@
 #define PLZ_UDP_PORT              54549
 #define MAX_JTIMER                1024 //spaces, tab, CRLF
 
-#define PLZ_SETTINGS_TIMESYNC     1     //0=OFF; 1=ON
-#define PLZ_SETTINGS_MQTT_TOPIC   0     //0=RAW value in one topic (ex: TELE/T1 = 19.20);
-                                        //1=JSON in category topic (ex: TELE/TMPS = "{\"INFO\":"DATA":{"T1":23.20}...}");
-                                        //2=RAW value in category topic (ex: TELE/TMPS/T1 = 19.20)
+#define PLZ_SETTINGS_TIMESYNC     1     // 0=OFF; 1=ON
+#define PLZ_SETTINGS_MQTT_TOPIC   0     // 0=RAW value in one topic (ex: TELE/T1 = 19.20);
+                                        // 1=JSON in category topic (ex: TELE/TMPS = "{\"INFO\":"DATA":{"T1":23.20}...}");
+                                        // 2=RAW value in category topic (ex: TELE/TMPS/T1 = 19.20)
+#define PLZ_SETTINGS_INTERVAL     15    // in seconds
+
 #define PLZ_SENDMSG_ENDPOINT       "/cgi-bin/sendmsg.lua"
 #define PLZ_SYSCMD_ENDPOINT        "/cgi-bin/syscmd.lua"
 #include "Palazzetti.h"
@@ -49,7 +51,7 @@ enum Palazzetti_Commands {
     CMND_PALAZZETTI_SENDMSG,
     CMND_PALAZZETTI_INIT,
     CMND_PALAZZETTI_INTERVAL,
-    CMND_PALAZZETTI_TIMESYNC,
+    CMND_PALAZZETTI_SYNCCLOCK,
     CMND_PALAZZETTI_MQTT
 };
 
@@ -62,31 +64,35 @@ struct {
     char cmd[29];  // cmd envoyée
     time_t ts;
     bool success = false;
-} plzIJson;
+} PlzIJson;
 
-struct plzRequest {
-    char *commandData = nullptr;
-    bool isConnected = false;
-    bool isGet = false;
-    bool isUdp = false;
-    bool isPost = false;
-} plzRequest;
+struct Palazzetti_Request {
+    char *command_data = nullptr;   // to store the whole command received
+    bool is_connected = false;      // is stove connected
+    bool is_get = false;            // is a get request
+    bool is_udp = false;            // is a udp request
+    bool is_post = false;           // is a post request
+    long last_attempt = 0;          // last retry connection attempt
+    long retry_interval = 60000;    // retry connection interval
+    uint8_t interval_counter = 0;   // counter in seconds
+} PlzRequest;
 
-struct plzSettings{
-    uint32_t crc32;                                     // To detect file changes
-    uint16_t version;                                   // To detect driver function changes
-    uint8_t sync_clock;
-    uint8_t interval;
-    uint8_t mqtt_topic;
-} PalazzettiSettings;
+struct Palazzetti_Settings {
+    uint32_t crc32;                 // to detect file changes
+    uint16_t version;               // to detect driver function changes
+    uint8_t sync_clock;             // to sync time of the stove from tasmota
+    uint8_t interval = 15;          // time between refresh requests
+    uint8_t mqtt_topic;             // mqtt topic style
+} PlzSettings;
 
-struct PlzJTimer {
+struct Palazzetti_JTimer {
     bool enabled = false;
     bool ecostart_mode_enabled = false;
     bool sync_clock_enabled = false;
     bool off_when_no_match = false;
     bool program_match = false;
     char program_id[64] = "PROGRAM_NOMATCH_OFF";
+    char last_edit[32] = "";
 } PlzJTimer;
 
 struct Plz {
@@ -206,12 +212,9 @@ bool plzUdpServerActive = false;
 uint8_t pala_rx_pin = NOT_A_PIN;
 uint8_t pala_tx_pin = NOT_A_PIN;
 uint8_t pala_detect_pin = NOT_A_PIN;
-uint8_t tcnt = 0;
-uint8_t plzInterval = 15;
 const uint16_t PLZ_SETTINGS_VERSION = 0x0100;
-unsigned long _lastAllStatusRefreshMillis = 0;
-unsigned long lastAttemptTime = 0;
-const unsigned long retryInterval = 60000;
+unsigned long last_all_status_refresh = 0;
+static char last_stove_datetime[20] = { 0 };
 time_t getTimeStamp() {
     return time(nullptr);
 }
@@ -225,6 +228,7 @@ const char kScenarioSettings[] PROGMEM = "SET SETP|SET POWR|SET RFAN|SET FN3L|SE
 const char* scenarioNames[] = {"off", "economy", "comfort", "warm"};
 
 const char TIME_HOUR_MINUTE[]            PROGMEM = "%02d:%02d";
+const char HTTP_PALAZZETTI_TITLE[]       PROGMEM = "{s}%s{m}%s{e}";
 const char HTTP_PALAZZETTI_TITLE_S[]     PROGMEM = "{s}%s{m}%s ";
 const char HTTP_PALAZZETTI_SIMPLE[]      PROGMEM = "{s}%s{m}%d %s{e}";
 const char HTTP_PALAZZETTI_POURCENT[]    PROGMEM = "{s}%s{m}%d " D_UNIT_PERCENT" {e}";
@@ -233,10 +237,14 @@ const char HTTP_PALAZZETTI_TEMPERATURE[] PROGMEM = "{s}%s{m}%s " D_UNIT_DEGREE "
 const char HTTP_PALAZZETTI_THERMOSTAT[]  PROGMEM = "{s}%s{m}%s " D_UNIT_DEGREE "%c ";
 const char HTTP_PALAZZETTI_TITLE_D[]     PROGMEM = "{s}%s{m}%d ";
 const char HTTP_PALAZZETTI_POWER_BTN[]   PROGMEM = "<button style=\"background:#%s\" onclick=\"fetch('" PLZ_SENDMSG_ENDPOINT "?cmd=%s')\">%s</button>";
+const char HTTP_PALAZZETTI_SLIDER_BTN2[] PROGMEM = "<button onclick=\"fetch('" PLZ_SENDMSG_ENDPOINT "?cmd=%s');\" style='width:15%%'>-</button>"
+                                                       "<input type='range' min='%d' max='%d' step='1' value='%s' onchange=\"fetch('" PLZ_SENDMSG_ENDPOINT "?cmd=%s+this.value');\"  style='width:69%%'/>"
+                                                       "<button onclick=\"fetch('" PLZ_SENDMSG_ENDPOINT "?cmd=%s');\" style='width:15%%'>+</button>";
+
 const char HTTP_PALAZZETTI_SLIDER_BTN[]  PROGMEM = "<td><button onclick=\"fetch('" PLZ_SENDMSG_ENDPOINT "?cmd=%s');\">-</button></td>"
                                                        "<td><input type='range' min='%d' max='%d' step='1' value='%s' onchange=\"fetch('" PLZ_SENDMSG_ENDPOINT "?cmd=%s+this.value');\" /></td>"
                                                        "<td><button onclick=\"fetch('" PLZ_SENDMSG_ENDPOINT "?cmd=%s');\">+</button>{e}";
-const char kPalazzetti_Commands[]        PROGMEM = "Sendmsg|Init|Interval|Timesync|Mqtt";
+const char kPalazzetti_Commands[]        PROGMEM = "Sendmsg|Init|Interval|Sync|Mqtt";
 const char JSON_STR_TEMPLATE[]           PROGMEM = "\"%s\":\"%s\",";
 const char JSON_INT_TEMPLATE[]           PROGMEM = "\"%s\":%d,";
 const char JSON_ELE_TEMPLATE[]           PROGMEM = "%d,";
@@ -338,7 +346,7 @@ const char JSON_MSG[]                    PROGMEM = "MSG";
 #define D_PLZ_PROP "Proportionel";
 
 const char* commandResultToString() {
-    switch (plzIJson.cmdRes) {
+    switch (PlzIJson.cmdRes) {
         case Palazzetti::CommandResult::OK:
             return "OK";
         case Palazzetti::CommandResult::ERROR:
@@ -499,7 +507,7 @@ char* PlzEncodeGzip(const char* data, size_t data_len, size_t* encoded_len) {
     } else {
         AddLog(LOG_LEVEL_ERROR, PSTR("PLZ: deflateInit2 success with code: %d"), ret);
     }
- 
+
     unsigned char* out = (unsigned char*)malloc(MAX_JTIMER);
     if (out == NULL) {
         AddLog(LOG_LEVEL_ERROR, PSTR("PLZ: Failed to allocate output buffer!"));
@@ -598,44 +606,44 @@ char *PlzDecodeGunzip(const char *input, size_t input_len, size_t *output_len) {
 void PlzJSONAddStr(const char* key, const char* value) {
     char temp[64];
     snprintf_P(temp, sizeof(temp), JSON_STR_TEMPLATE, key, value);
-    strcat_P(plzIJson.data, temp);
+    strcat_P(PlzIJson.data, temp);
 }
 
 void PlzJSONAddInt(const char* key, int value) {
     char temp[32];
     snprintf_P(temp, sizeof(temp), JSON_INT_TEMPLATE, key, value);
-    strcat_P(plzIJson.data, temp);
+    strcat_P(PlzIJson.data, temp);
 }
 
 void PlzJSONAddIntArr(int value) {
     char temp[32];
     snprintf_P(temp, sizeof(temp), JSON_ELE_TEMPLATE, value);
-    strcat_P(plzIJson.data, temp);
+    strcat_P(PlzIJson.data, temp);
 }
 
 void PlzJSONAddBool(const char* key, bool value) {
     char temp[32];
     snprintf_P(temp, sizeof(temp), JSON_BOOL_TEMPLATE, key, value ? PSTR("true") : PSTR("false"));
-    strcat_P(plzIJson.data, temp);
+    strcat_P(PlzIJson.data, temp);
 }
 
 void PlzJSONAddFloat(const char *key, float value) {//hack float
     char temp[32];
     String formattedValue = String(value, 2);
     snprintf(temp, sizeof(temp), JSON_BOOL_TEMPLATE, key, formattedValue.c_str());
-    strcat_P(plzIJson.data, temp);
+    strcat_P(PlzIJson.data, temp);
 }
 
 void PlzJSONAddObj(const char* data) {
     char temp[256];
     snprintf_P(temp, sizeof(temp), JSON_OBJ_TEMPLATE, data);
-    strcat_P(plzIJson.data, temp);
+    strcat_P(PlzIJson.data, temp);
 }
 
 void PlzJSONAddArray(const char* data) {
     char temp[256];
     snprintf_P(temp, sizeof(temp), JSON_ARRAY_TEMPLATE, data);
-    strcat_P(plzIJson.data, temp);
+    strcat_P(PlzIJson.data, temp);
 }
 
 void PlzJSONAddArray(const char* key, uint16_t* values, int count) {
@@ -649,56 +657,57 @@ void PlzJSONAddArray(const char* key, uint16_t* values, int count) {
         offset += snprintf_P(temp + offset, sizeof(temp) - offset, PSTR("%d"), values[i]);
     }
     offset += snprintf_P(temp + offset, sizeof(temp) - offset, PSTR("]"));
-    strcat_P(plzIJson.data, temp);
+    strcat_P(PlzIJson.data, temp);
 }
 
 void PlzJSONAddCSV(const char* key, int value) {
     char line[50];
     snprintf(line, sizeof(line), "%s;%d\r\n", key, value);
-    strncat(plzIJson.data, line, sizeof(plzIJson.data) - strlen(plzIJson.data) - 1);
+    strncat(PlzIJson.data, line, sizeof(PlzIJson.data) - strlen(PlzIJson.data) - 1);
 }
 
 void PlzJSONMerge() {
-    snprintf_P(plzIJson.info, sizeof(plzIJson.info), JSON_INFO_TEMPLATE);
+    snprintf_P(PlzIJson.info, sizeof(PlzIJson.info), JSON_INFO_TEMPLATE);
 
     char temp[256];
-    snprintf_P(temp, sizeof(temp), JSON_STR_TEMPLATE, JSON_CMD, plzIJson.cmd);
-    strcat_P(plzIJson.info, temp);
+    snprintf_P(temp, sizeof(temp), JSON_STR_TEMPLATE, JSON_CMD, PlzIJson.cmd);
+    strcat_P(PlzIJson.info, temp);
 
     snprintf_P(temp, sizeof(temp), JSON_STR_TEMPLATE, JSON_RSP, commandResultToString());
-    strcat_P(plzIJson.info, temp);
+    strcat_P(PlzIJson.info, temp);
 
     snprintf_P(temp, sizeof(temp), JSON_INT_TEMPLATE, JSON_TS, getTimeStamp());
-    strcat_P(plzIJson.info, temp);
+    strcat_P(PlzIJson.info, temp);
 
-    if (plzIJson.msg[0] != 0/* && strcmp(commandResultToString(), "OK") != 0*/) {        
-        snprintf_P(temp, sizeof(temp), JSON_STR_TEMPLATE, JSON_MSG, plzIJson.msg);
-        strcat_P(plzIJson.info, temp);
+    if (PlzIJson.msg[0] != 0/* && strcmp(commandResultToString(), "OK") != 0*/) {
+        snprintf_P(temp, sizeof(temp), JSON_STR_TEMPLATE, JSON_MSG, PlzIJson.msg);
+        strcat_P(PlzIJson.info, temp);
     }
 
-    PlzJSONRemoveComma(plzIJson.info);
+    PlzJSONRemoveComma(PlzIJson.info);
+    PlzJSONRemoveComma(PlzIJson.data);
 
-    strcat_P(plzIJson.info, JSON_OBJ_CLOSE_COMMA);
+    strcat_P(PlzIJson.info, JSON_OBJ_CLOSE_COMMA);
 
-    snprintf_P(plzIJson.full, sizeof(plzIJson.full), PSTR("{%s%s}"), plzIJson.info, plzIJson.data);
+    snprintf_P(PlzIJson.full, sizeof(PlzIJson.full), PSTR("{%s%s}"), PlzIJson.info, PlzIJson.data);
 }
 
 void PlzJSONOpenObj() {
-    strcat_P(plzIJson.data, JSON_OBJ_OPEN);
+    strcat_P(PlzIJson.data, JSON_OBJ_OPEN);
 }
 
 void PlzJSONCloseObj() {
-    PlzJSONRemoveComma(plzIJson.data);
-    strcat_P(plzIJson.data, JSON_OBJ_CLOSE);
+    PlzJSONRemoveComma(PlzIJson.data);
+    strcat_P(PlzIJson.data, JSON_OBJ_CLOSE);
 }
 
 void PlzJSONCloseArray() {
-    PlzJSONRemoveComma(plzIJson.data);
-    strcat_P(plzIJson.data, JSON_ARRAY_CLOSE);
+    PlzJSONRemoveComma(PlzIJson.data);
+    strcat_P(PlzIJson.data, JSON_ARRAY_CLOSE);
 }
 
 void PlzJSONAddComma() {
-    strcat_P(plzIJson.data, JSON_COMMA);
+    strcat_P(PlzIJson.data, JSON_COMMA);
 }
 
 void PlzJSONRemoveComma(char* json) {
@@ -740,7 +749,7 @@ void PlzInit(void)
         return;
     }
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: RX on GPIO%d, TX on GPIO%d, Det on GPIO%d, baudrate %d"), pala_rx_pin, pala_tx_pin, pala_detect_pin, PLZ_BAUDRATE);
-    
+
     if (!plzSerial) {
 #ifdef ESP8266
         plzSerial = new TasmotaSerial(pala_rx_pin, pala_tx_pin, 2, 0);
@@ -763,7 +772,7 @@ void PlzInit(void)
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Hardware detected %d"), hwVersion);
 
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Initializing serial..."));
-    plzIJson.cmdRes = pala.initialize(
+    PlzIJson.cmdRes = pala.initialize(
         std::bind(&PlzOpenSerial, std::placeholders::_1),
         std::bind(&PlzCloseSerial),
         std::bind(&PlzSelectSerial, std::placeholders::_1),
@@ -776,20 +785,20 @@ void PlzInit(void)
     );
 
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Connecting to Palazzetti stove..."));
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Palazzetti connected"));
-        plzRequest.isConnected = true;
-        plzIJson.cmdRes = pala.getSN(&Plz.SN);
+        PlzRequest.is_connected = true;
+        PlzIJson.cmdRes = pala.getSN(&Plz.SN);
         AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Commande response Plz.SN=%s"), Plz.SN);
 
+        int32_t diff = UpdateDevicesPresent(1); // claim a power device slot
+        AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Commande UpdateDevicesPresent %d"), diff);
+
+        PlzUpdate();
     } else {
         AddLog(LOG_LEVEL_ERROR, PSTR("PLZ: Palazzetti stove connection failed"));
     }
 
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
-        PlzUpdate();
-    }
-    
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Shutting down UDP Server..."));
     if (plzUdpServerActive) {
         plzUdpServer.clear();
@@ -802,7 +811,7 @@ void PlzInit(void)
         return;
     }
     if (!plzUdpServerActive) {
-        if (!plzUdpServer.begin(54549)) {
+        if (!plzUdpServer.begin(PLZ_UDP_PORT)) {
             AddLog(LOG_LEVEL_INFO, PSTR("PLZ: UDP server is down"));
             return;
         }
@@ -819,7 +828,7 @@ int PlzDetectHardWare() {
 
 /* ======================================================================
 Function: PlzSaveBeforeRestart
-Purpose : 
+Purpose :
 Input   : -
 Output  : -
 Comments: -
@@ -945,35 +954,35 @@ void PlzHandleUdpRequest() {
             strData += (char)bufferByte;
         }
 
-        plzRequest.isUdp = true;
+        PlzRequest.is_udp = true;
 
         if (strData.endsWith("bridge?")) {
-            plzRequest.commandData = (char*)malloc(strlen("GET STDT") + 1);
-            if (plzRequest.commandData != nullptr) {
-                strcpy(plzRequest.commandData, "GET STDT");
+            PlzRequest.command_data = (char*)malloc(strlen("GET STDT") + 1);
+            if (PlzRequest.command_data != nullptr) {
+                strcpy(PlzRequest.command_data, "GET STDT");
                 PlzParser();
-                free(plzRequest.commandData);  // Libérer la mémoire après utilisation
-                plzRequest.commandData = nullptr;
+                free(PlzRequest.command_data);
+                PlzRequest.command_data = nullptr;
             }
         } else if (strData.endsWith("bridge?GET ALLS")) {
-            plzRequest.commandData = (char*)malloc(strlen("GET ALLS") + 1);
-            if (plzRequest.commandData != nullptr) {
-                strcpy(plzRequest.commandData, "GET ALLS");
+            PlzRequest.command_data = (char*)malloc(strlen("GET ALLS") + 1);
+            if (PlzRequest.command_data != nullptr) {
+                strcpy(PlzRequest.command_data, "GET ALLS");
                 PlzParser();
-                free(plzRequest.commandData);  // Libérer la mémoire après utilisation
-                plzRequest.commandData = nullptr;
+                free(PlzRequest.command_data);
+                PlzRequest.command_data = nullptr;
             }
         } else {
             AddLog(LOG_LEVEL_ERROR, PSTR("PLZ: Unrecognized UDP command received"));
         }
 
-        if (plzIJson.full[0] != '\0') {
+        if (PlzIJson.full[0] != '\0') {
             plzUdpServer.beginPacket(plzUdpServer.remoteIP(), plzUdpServer.remotePort());
-            size_t length = strlen(plzIJson.full);
-            size_t bytesSent = plzUdpServer.write((const uint8_t *)plzIJson.full, length);
+            size_t length = strlen(PlzIJson.full);
+            size_t bytesSent = plzUdpServer.write((const uint8_t *)PlzIJson.full, length);
 
             if (bytesSent == length) {
-                AddLog(LOG_LEVEL_INFO, PSTR("PLZ: UDP message sent successfully: %s"), plzIJson.full);
+                AddLog(LOG_LEVEL_INFO, PSTR("PLZ: UDP message sent successfully: %s"), PlzIJson.full);
             } else {
                 AddLog(LOG_LEVEL_ERROR, PSTR("PLZ: Failed to send UDP message"));
             }
@@ -991,7 +1000,7 @@ void PlzHandleUdpRequest() {
 Function: PlzShow
 Purpose : Display Palazzetti infos on WEB Interface
 ====================================================================== */
-void PlzShow(bool json) 
+void PlzShow(bool json)
 {
     if (json) {
         AddLog(LOG_LEVEL_INFO, PSTR("PLZ: PlzShow json"));
@@ -1013,6 +1022,11 @@ void PlzShow(bool json)
         bool hasSecondFan   = (Plz.FAN2TYPE > 2); //hasZeroSpeedFan
         bool hasThirdFan    = (Plz.FAN2TYPE > 3);
         bool hasRemoteProbe = ((Plz.BLEMBMODE == 7 || Plz.BLEMBMODE == 17) && (Plz.BLEDSPMODE == 7 || Plz.BLEDSPMODE == 17));
+        bool hasBurningTime = (Plz.MBTYPE == 0);
+        bool isMicronova    = (Plz.MBTYPE == 0 || Plz.MBTYPE == 1 || Plz.MBTYPE == 5 || Plz.MBTYPE == 6 || Plz.MBTYPE == 7);
+        bool isATech        = (Plz.MBTYPE == 10 || Plz.MBTYPE == 11 || Plz.MBTYPE == 12 || Plz.MBTYPE == 13 || Plz.MBTYPE == 14
+                            || Plz.MBTYPE == 15 || Plz.MBTYPE == 100);
+        bool isChronoBox    = (Plz.CHRSTATUS == 1); // 0=App ; 1=Pala
         bool isFan3ASwitch  = (Plz.FANLMINMAX[2] == 0 && Plz.FANLMINMAX[3] == 1);
         bool isFan4ASwitch  = (Plz.FANLMINMAX[4] == 0 && Plz.FANLMINMAX[5] == 1);
         bool hasFanAuto     = (Plz.FAN2MODE == 2 || Plz.FAN2MODE == 3); // F2L==> 0=OFF ; 7=AUTO
@@ -1021,51 +1035,63 @@ void PlzShow(bool json)
         bool isIdroType     = (Plz.STOVETYPE == 2 || Plz.STOVETYPE == 4 || Plz.STOVETYPE == 6);
         bool hasError       = (Plz.LSTATUS >= 1000);
         bool isStopped      = (Plz.STATUS == 0 || Plz.LSTATUS == 1);
-        bool isStarted      = (Plz.LSTATUS == 0 || Plz.LSTATUS == 1 || Plz.LSTATUS == 6 || Plz.LSTATUS == 7 || Plz.LSTATUS == 9 
+        bool isStarted      = (Plz.LSTATUS == 0 || Plz.LSTATUS == 1 || Plz.LSTATUS == 6 || Plz.LSTATUS == 7 || Plz.LSTATUS == 9
                             || Plz.LSTATUS == 11 || Plz.LSTATUS == 12 || Plz.LSTATUS == 51 || Plz.LSTATUS == 501 || Plz.LSTATUS == 504
                             || Plz.LSTATUS == 505 || Plz.LSTATUS == 506 || Plz.LSTATUS == 507);
 
-        if (hasSwitch) {
-            if (isStopped) { 
+        /*if (hasSwitch) {
+            if (isStopped) {
                 WSContentSend_P(HTTP_PALAZZETTI_POWER_BTN, "1bcc4d", "CMD+ON", D_ON);
             } else {
-                if (isStarted) { 
+                if (isStarted) {
                     WSContentSend_P(HTTP_PALAZZETTI_POWER_BTN, "ff3333", "CMD+OFF", D_OFF);
                 } else {
                     WSContentSend_P(HTTP_PALAZZETTI_POWER_BTN, "ffc233", "CMD+OFF", D_OFF);
                 }
             }
-        }
+        }*/
 
         WSContentSend_P("{t}");
-        if (hasSwitch) {
-            WSContentSend_PD(HTTP_PALAZZETTI_TITLE_S, "Statut", getPlzStatusMessage(Plz.STATUS));
-        }
+        WSContentSend_PD(HTTP_PALAZZETTI_TITLE, "Statut", getPlzStatusMessage(Plz.STATUS));
 
         if (Plz.F2L == 0) {
+            WSContentSend_P(HTTP_PALAZZETTI_TITLE_S, "Silence", "");
             WSContentSend_P(HTTP_PALAZZETTI_POWER_BTN, "ff3333", "SET+SLNT+0", D_PLZ_SLNT_OFF);
+            WSContentSend_P("{e}");
         } else {
+            WSContentSend_P(HTTP_PALAZZETTI_TITLE_S, "Silence", "");
             WSContentSend_P(HTTP_PALAZZETTI_POWER_BTN, "1bcc4d", "SET+SLNT+1", D_PLZ_SLNT_ON);
+            WSContentSend_P("{e}");
         }
+        WSContentSend_P("</table>");
 
         if (hasSetPoint) {
-            WSContentSend_P(HTTP_PALAZZETTI_THERMOSTAT, D_PLZ_SET_POINT, String(Plz.SETP, 2).c_str(), D_UNIT_CELSIUS[0]);
-            WSContentSend_P(HTTP_PALAZZETTI_SLIDER_BTN, "SET+STPD", Plz.SPLMIN, Plz.SPLMAX, String(Plz.SETP, 2).c_str(), "SET+SETP", "SET+STPU");
+            WSContentSend_P("{t}");
+            WSContentSend_PD(HTTP_PALAZZETTI_THERMOSTAT, D_PLZ_SET_POINT, String(Plz.SETP, 2).c_str(), D_UNIT_CELSIUS[0]);
+            WSContentSend_P("{e}");
+            WSContentSend_P("</table>");
+            WSContentSend_P(HTTP_PALAZZETTI_SLIDER_BTN2, "SET+STPD", Plz.SPLMIN, Plz.SPLMAX, String(Plz.SETP, 2).c_str(), "SET+SETP", "SET+STPU");
+            WSContentSend_P("{t}");
             WSContentSend_PD(HTTP_PALAZZETTI_TITLE_D, D_PLZ_POWER, Plz.PWR);
-
-            WSContentSend_P(HTTP_PALAZZETTI_SLIDER_BTN, "SET+PWRD", 1, 5, String(Plz.PWR).c_str(), "SET+POWR", "SET+PWRU");
+            WSContentSend_P("{e}");
+            WSContentSend_P("</table>");
+            WSContentSend_P(HTTP_PALAZZETTI_SLIDER_BTN2, "SET+PWRD", 1, 5, String(Plz.PWR).c_str(), "SET+POWR", "SET+PWRU");
         }
 
-        WSContentSend_P("</table>{t}");
-
         if (hasFirstFan) {
+            WSContentSend_P("{t}");
             WSContentSend_PD(HTTP_PALAZZETTI_TITLE_S, D_PLZ_MAIN_FAN, getPlzFanStatus(Plz.F2L));
+            WSContentSend_P("{e}");
+            WSContentSend_P("</table>");
             int maxValue = (hasFanProp ? 8 : (hasFanAuto ? 7 : Plz.FANLMINMAX[1]));
-            WSContentSend_P(HTTP_PALAZZETTI_SLIDER_BTN, "SET+FN2D", Plz.FANLMINMAX[0], maxValue, String(Plz.F2L).c_str(), "SET+RFAN", "SET+FN2U");
+            WSContentSend_P(HTTP_PALAZZETTI_SLIDER_BTN2, "SET+FN2D", Plz.FANLMINMAX[0], maxValue, String(Plz.F2L).c_str(), "SET+RFAN", "SET+FN2U");
         }
 
         if (hasSecondFan) {
+            WSContentSend_P("{t}");
             WSContentSend_PD(HTTP_PALAZZETTI_TITLE_D, D_PLZ_FAN4, Plz.F4L);
+            WSContentSend_P("{e}");
+            WSContentSend_P("</table>");
             char cmndOff4[10];
             char cmndOn4[10];
             snprintf_P(cmndOff4, sizeof(cmndOff4), PSTR("SET+FN4L+%d"), Plz.FANLMINMAX[4]);
@@ -1082,7 +1108,10 @@ void PlzShow(bool json)
         }
 
         if (hasThirdFan) {
+            WSContentSend_P("{t}");
             WSContentSend_PD(HTTP_PALAZZETTI_TITLE_D, D_PLZ_FAN3, Plz.F3L);
+            WSContentSend_P("{e}");
+            WSContentSend_P("</table>");
             char cmndOff3[10];
             char cmndOn3[10];
             snprintf_P(cmndOff3, sizeof(cmndOff3), PSTR("SET+FN3L+%d"), Plz.FANLMINMAX[2]);
@@ -1121,7 +1150,7 @@ void PlzShow(bool json)
         if (Plz.LSTATUS >= 1000) {
             WSContentSend_P(PSTR("<div style='color:red;'>Erreur poêle</div>"));
         }
-        
+
         if (Plz.IGN == 1) {
             //WSContentSend_P(PSTR("<div>Brûleur en marche</div>"));
         } else {
@@ -1138,38 +1167,38 @@ void PlzSendmsgGetRequestHandler(void) {
     if (!HttpCheckPriviledgedAccess()) {
         return;
     }
-    plzRequest.isGet = true;
-    char tempCmd[512]; //dev in progress, move to 30 once finished
+    PlzRequest.is_get = true;
+    char tempCmd[30]; //dev in progress, move to 30 once finished
 
     WebGetArg(PSTR("cmd"), tempCmd, sizeof(tempCmd));
     if (strlen(tempCmd) > 0) {
-        plzRequest.commandData = (char*)malloc(strlen(tempCmd) + 1);
-        if (plzRequest.commandData != nullptr) {
-            strcpy(plzRequest.commandData, tempCmd);
-            AddLog(LOG_LEVEL_INFO, PSTR("PLZ: SENDMSG received with cmd: %s"), plzRequest.commandData);
+        PlzRequest.command_data = (char*)malloc(strlen(tempCmd) + 1);
+        if (PlzRequest.command_data != nullptr) {
+            strcpy(PlzRequest.command_data, tempCmd);
+            AddLog(LOG_LEVEL_INFO, PSTR("PLZ: SENDMSG received with cmd: %s"), PlzRequest.command_data);
             if (PlzParser()) {
                 AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Command PlzParser successful"));
             } else {
                 AddLog(LOG_LEVEL_ERROR, PSTR("PLZ: Command failed"));
             }
-            free(plzRequest.commandData);
-            plzRequest.commandData = nullptr;
+            free(PlzRequest.command_data);
+            PlzRequest.command_data = nullptr;
         }
     }
 
     WebGetArg(PSTR("command"), tempCmd, sizeof(tempCmd));
     if (strlen(tempCmd) > 0) {
-        plzRequest.commandData = (char*)malloc(strlen(tempCmd) + 1);
-        if (plzRequest.commandData != nullptr) {
-            strcpy(plzRequest.commandData, tempCmd);
-            AddLog(LOG_LEVEL_INFO, PSTR("PLZ: SENDMSG received with command: %s"), plzRequest.commandData);
+        PlzRequest.command_data = (char*)malloc(strlen(tempCmd) + 1);
+        if (PlzRequest.command_data != nullptr) {
+            strcpy(PlzRequest.command_data, tempCmd);
+            AddLog(LOG_LEVEL_INFO, PSTR("PLZ: SENDMSG received with command: %s"), PlzRequest.command_data);
             if (PlzParser()) {
                 AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Command PlzParser successful"));
             } else {
                 AddLog(LOG_LEVEL_ERROR, PSTR("PLZ: Command failed"));
             }
-            free(plzRequest.commandData);
-            plzRequest.commandData = nullptr;
+            free(PlzRequest.command_data);
+            PlzRequest.command_data = nullptr;
         }
     }
 }
@@ -1178,8 +1207,8 @@ void PlzSendmsgPostRequestHandler(void) {
     if (!HttpCheckPriviledgedAccess()) {
         return;
     }
-    plzRequest.isGet = true;
-    plzRequest.isPost = true;
+    PlzRequest.is_get = true;
+    PlzRequest.is_post = true;
     char event[500];
     strlcpy(event, Webserver->arg(0).c_str(), sizeof(event));
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: SENDMSG POST received with event: %s"), event);
@@ -1201,14 +1230,14 @@ void PlzSendmsgPostRequestHandler(void) {
         return;
     }
     size_t cmdLength = strlen(command.getStr());
-    plzRequest.commandData = (char*)malloc(cmdLength + 1);
-    if (plzRequest.commandData == nullptr) {
-        AddLog(LOG_LEVEL_ERROR, PSTR("PLZ: Memory allocation for commandData failed"));
+    PlzRequest.command_data = (char*)malloc(cmdLength + 1);
+    if (PlzRequest.command_data == nullptr) {
+        AddLog(LOG_LEVEL_ERROR, PSTR("PLZ: Memory allocation for command_data failed"));
         return;
     }
 
-    strlcpy(plzRequest.commandData, command.getStr(), cmdLength + 1);
-    AddLog(LOG_LEVEL_INFO, PSTR("PLZ: SENDMSG POST received with cmd: %s"), plzRequest.commandData);
+    strlcpy(PlzRequest.command_data, command.getStr(), cmdLength + 1);
+    AddLog(LOG_LEVEL_INFO, PSTR("PLZ: SENDMSG POST received with cmd: %s"), PlzRequest.command_data);
 
     if (PlzParser()) {
         AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Command PlzParser successful"));
@@ -1216,15 +1245,15 @@ void PlzSendmsgPostRequestHandler(void) {
         AddLog(LOG_LEVEL_ERROR, PSTR("PLZ: Command failed"));
     }
 
-    free(plzRequest.commandData);  // Libérer la mémoire après utilisation
-    plzRequest.commandData = nullptr;
+    free(PlzRequest.command_data);
+    PlzRequest.command_data = nullptr;
 }
 
 void PlzSyscmdRequestHandler(void) {
     if (!HttpCheckPriviledgedAccess()) {
         return;
     }
-    plzRequest.isGet = true;
+    PlzRequest.is_get = true;
     char cmd[29];
     WebGetArg(PSTR("cmd"), cmd, sizeof(cmd));
 
@@ -1238,10 +1267,57 @@ void PlzSyscmdRequestHandler(void) {
     }
 }
 
+void PlzSyncClockWithStove(void) {
+    static char last_stove_datetime[32] = { 0 };
+    char formatted_stove_datetime[32] = { 0 };
+
+    if (strlen(Plz.STOVE_DATETIME) >= sizeof(formatted_stove_datetime) - 1) {
+        return;
+    }
+
+    snprintf(formatted_stove_datetime, sizeof(formatted_stove_datetime), "%s", Plz.STOVE_DATETIME);
+    char *space_pos = strchr(formatted_stove_datetime, ' ');
+    if (space_pos) {
+        *space_pos = 'T';
+    }
+
+    if (strcmp(formatted_stove_datetime, last_stove_datetime) != 0) {
+        strncpy(last_stove_datetime, formatted_stove_datetime, sizeof(last_stove_datetime));
+
+        String tasmota_time = GetDateAndTime(DT_LOCAL);
+
+        int stove_year, stove_month, stove_day, stove_hour, stove_minute, stove_second;
+
+        if (sscanf(formatted_stove_datetime, "%d-%d-%dT%d:%d:%d",
+                   &stove_year, &stove_month, &stove_day,
+                   &stove_hour, &stove_minute, &stove_second) == 6) {
+            int tasmota_year, tasmota_month, tasmota_day, tasmota_hour, tasmota_minute, tasmota_second;
+
+            sscanf(tasmota_time.c_str(), "%d-%d-%dT%d:%d:%d",
+                   &tasmota_year, &tasmota_month, &tasmota_day,
+                   &tasmota_hour, &tasmota_minute, &tasmota_second);
+
+            int stove_total_minutes = stove_hour * 60 + stove_minute;
+            int tasmota_total_minutes = tasmota_hour * 60 + tasmota_minute;
+            int diff_minutes = abs(stove_total_minutes - tasmota_total_minutes);
+
+            AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Diff_minutes: %d"), diff_minutes);
+
+            if (diff_minutes >= 2) {
+                char cmdBuffer[64];
+                snprintf(cmdBuffer, sizeof(cmdBuffer), "Palazzetti sendmsg SET TIME %s", tasmota_time.c_str());
+                AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Sending SET+TIME+%s"), tasmota_time.c_str());
+
+                ExecuteCommand(cmdBuffer, SRC_WEBCONSOLE);
+            }
+        }
+    }
+}
+
 void PlzUpdate(void)
 {
-    if (++tcnt < plzInterval) return;
-    tcnt = 0;
+    if (++PlzRequest.interval_counter < PlzSettings.interval) return;
+    PlzRequest.interval_counter = 0;
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: update"));
 
     const char* cmdList[] = {
@@ -1251,39 +1327,39 @@ void PlzUpdate(void)
     };
 
     for (const char* cmd : cmdList) {
-        plzRequest.commandData = (char*)malloc(strlen(cmd) + 1);
-        if (plzRequest.commandData == nullptr) {
-            AddLog(LOG_LEVEL_ERROR, PSTR("PLZ: Memory allocation for commandData failed"));
+        PlzRequest.command_data = (char*)malloc(strlen(cmd) + 1);
+        if (PlzRequest.command_data == nullptr) {
+            AddLog(LOG_LEVEL_ERROR, PSTR("PLZ: Memory allocation for command_data failed"));
             break;
         }
 
-        strcpy(plzRequest.commandData, cmd);
+        strcpy(PlzRequest.command_data, cmd);
 
         if (!PlzParser()) {
-            AddLog(LOG_LEVEL_ERROR, PSTR("Command failed: %s"), plzRequest.commandData);
-            free(plzRequest.commandData);
-            plzRequest.commandData = nullptr;
+            AddLog(LOG_LEVEL_ERROR, PSTR("Command failed: %s"), PlzRequest.command_data);
+            free(PlzRequest.command_data);
+            PlzRequest.command_data = nullptr;
             break;
         }
 
-        free(plzRequest.commandData);
-        plzRequest.commandData = nullptr;
+        free(PlzRequest.command_data);
+        PlzRequest.command_data = nullptr;
     }
 }
 
 void PlzGetAllHiddenParameters(const char *cmnd) {
     char fileType[5];
     strncpy(fileType, cmnd + 5, 4);
-    fileType[4] = '\0'; 
+    fileType[4] = '\0';
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Commande getAllHiddenParameters=%s"), fileType);
     if (!isValidFileType(fileType)) {
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Unknown filetype: %s"), fileType);
-        plzIJson.cmdRes = Palazzetti::CommandResult::UNSUPPORTED;
-        WSSend(200, CT_APP_JSON, plzIJson.full);
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Unknown filetype: %s"), fileType);
+        PlzIJson.cmdRes = Palazzetti::CommandResult::UNSUPPORTED;
+        WSSend(200, CT_APP_JSON, PlzIJson.full);
         return;
     }
-    plzIJson.cmdRes = pala.getAllHiddenParameters(&Plz.hiddenParams);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.getAllHiddenParameters(&Plz.hiddenParams);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         char cmdParm[5];
         strncpy(cmdParm, cmnd, 4);
         cmdParm[4] = '\0';
@@ -1295,16 +1371,16 @@ void PlzGetAllHiddenParameters(const char *cmnd) {
 void PlzGetAllParameters(const char *cmnd) {
     char fileType[5];
     strncpy(fileType, cmnd + 5, 4);
-    fileType[4] = '\0'; 
+    fileType[4] = '\0';
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Commande getAllParameters=%s"), fileType);
     if (!isValidFileType(fileType)) {
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Unknown filetype: %s"), fileType);
-        plzIJson.cmdRes = Palazzetti::CommandResult::UNSUPPORTED;
-        WSSend(200, CT_APP_JSON, plzIJson.full);
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Unknown filetype: %s"), fileType);
+        PlzIJson.cmdRes = Palazzetti::CommandResult::UNSUPPORTED;
+        WSSend(200, CT_APP_JSON, PlzIJson.full);
         return;
     }
-    plzIJson.cmdRes = pala.getAllParameters(&Plz.params);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.getAllParameters(&Plz.params);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         char cmdParm[5];
         strncpy(cmdParm, cmnd, 4);
         cmdParm[4] = '\0';
@@ -1314,11 +1390,11 @@ void PlzGetAllParameters(const char *cmnd) {
 
 void PlzGetAllStatus() {
     unsigned long currentMillis = millis();
-    bool refreshStatus = ((currentMillis - _lastAllStatusRefreshMillis) > 15000UL);
-    plzIJson.cmdRes = pala.getAllStatus(refreshStatus, &Plz.MBTYPE, &Plz.MOD, &Plz.VER, &Plz.CORE, &Plz.FWDATE, &Plz.APLTS, &Plz.APLWDAY, &Plz.CHRSTATUS, &Plz.STATUS, &Plz.LSTATUS, &Plz.isMFSTATUSValid, &Plz.MFSTATUS, &Plz.SETP, &Plz.PUMP, &Plz.PQT, &Plz.F1V, &Plz.F1RPM, &Plz.F2L, &Plz.F2LF, &Plz.FANLMINMAX, &Plz.F2V, &Plz.isF3LF4LValid, &Plz.F3L, &Plz.F4L, &Plz.PWR, &Plz.FDR, &Plz.DPT, &Plz.DP, &Plz.IN, &Plz.OUT, &Plz.T1, &Plz.T2, &Plz.T3, &Plz.T4, &Plz.T5, &Plz.isSNValid, &Plz.SN);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    bool refreshStatus = ((currentMillis - last_all_status_refresh) > 15000UL);
+    PlzIJson.cmdRes = pala.getAllStatus(refreshStatus, &Plz.MBTYPE, &Plz.MOD, &Plz.VER, &Plz.CORE, &Plz.FWDATE, &Plz.APLTS, &Plz.APLWDAY, &Plz.CHRSTATUS, &Plz.STATUS, &Plz.LSTATUS, &Plz.isMFSTATUSValid, &Plz.MFSTATUS, &Plz.SETP, &Plz.PUMP, &Plz.PQT, &Plz.F1V, &Plz.F1RPM, &Plz.F2L, &Plz.F2LF, &Plz.FANLMINMAX, &Plz.F2V, &Plz.isF3LF4LValid, &Plz.F3L, &Plz.F4L, &Plz.PWR, &Plz.FDR, &Plz.DPT, &Plz.DP, &Plz.IN, &Plz.OUT, &Plz.T1, &Plz.T2, &Plz.T3, &Plz.T4, &Plz.T5, &Plz.isSNValid, &Plz.SN);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         if (refreshStatus) {
-            _lastAllStatusRefreshMillis = currentMillis;
+            last_all_status_refresh = currentMillis;
         }
         PlzJSONAddInt("MBTYPE", Plz.MBTYPE);
         PlzJSONAddStr("MAC", WiFi.macAddress().c_str());
@@ -1368,8 +1444,8 @@ void PlzGetAllStatus() {
 }
 
 void PlzGetAllTemps() {
-    plzIJson.cmdRes = pala.getAllTemps(&Plz.T1, &Plz.T2, &Plz.T3, &Plz.T4, &Plz.T5);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.getAllTemps(&Plz.T1, &Plz.T2, &Plz.T3, &Plz.T4, &Plz.T5);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddFloat("T1", Plz.T1);
         PlzJSONAddFloat("T2", Plz.T2);
         PlzJSONAddFloat("T3", Plz.T3);
@@ -1379,8 +1455,8 @@ void PlzGetAllTemps() {
 }
 
 void PlzGetChronoData() {
-    plzIJson.cmdRes = pala.getChronoData(&Plz.CHRSTATUS, &Plz.PCHRSETP, &Plz.PSTART, &Plz.PSTOP, &Plz.DM);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.getChronoData(&Plz.CHRSTATUS, &Plz.PCHRSETP, &Plz.PSTART, &Plz.PSTOP, &Plz.DM);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddInt("CHRSTATUS", Plz.CHRSTATUS);
         PlzJSONAddObj("Programs");
         for (byte i = 0; i < 6; i++) {
@@ -1418,8 +1494,8 @@ void PlzGetChronoData() {
 
 void PlzGetJTimer() {
     // Obtenez les données de chrono depuis pala.getChronoData
-    plzIJson.cmdRes = pala.getChronoData(&Plz.CHRSTATUS, &Plz.PCHRSETP, &Plz.PSTART, &Plz.PSTOP, &Plz.DM);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.getChronoData(&Plz.CHRSTATUS, &Plz.PCHRSETP, &Plz.PSTART, &Plz.PSTOP, &Plz.DM);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         char jsonBuffer[MAX_JTIMER] = { 0 }; // Buffer pour stocker le JSON
         size_t offset = 0;
 
@@ -1430,8 +1506,8 @@ void PlzGetJTimer() {
         offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, "\"curr_timezone_country\": \"%s\",", String(Settings->timezone).c_str());
         offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, "\"enabled\": %s,", Settings->flag3.timers_enable ? "true" : "false");
         offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, "\"off_when_nomatch\": %s,", PlzJTimer.off_when_no_match ? "true" : "false");
-        offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, "\"sync_clock_enabled\": %s,", PalazzettiSettings.sync_clock ? "true" : "false");
-        offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, "\"last_edit\": \"%s\",", "2024-11-30T15:24:25+01:00");
+        offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, "\"sync_clock_enabled\": %s,", PlzSettings.sync_clock ? "true" : "false");
+        offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, "\"last_edit\": \"%s\",", PlzJTimer.last_edit);
 
         // Scenarios
         offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, "\"scenarios\": {");
@@ -1487,10 +1563,10 @@ void PlzGetJTimer() {
         if (encodedData) {
             char finalJson[1024];
             snprintf_P(finalJson, sizeof(finalJson), JSON_STR_TEMPLATE, "TIMER", encodedData);
-            strcat_P(plzIJson.data, finalJson);
+            strcat_P(PlzIJson.data, finalJson);
             free(encodedData);
         } else {
-            snprintf_P(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Failed to encode datas"));
+            snprintf_P(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Failed to encode datas"));
             AddLog(LOG_LEVEL_ERROR, PSTR("PLZ: Failed to encode JSON"));
         }
     }
@@ -1529,18 +1605,18 @@ void PlzSetJTimer(const char *encoded_data) {
     }
 
     PlzJTimer.sync_clock_enabled = root.getBool("sync_clock_enabled", false);
-    if (PlzJTimer.sync_clock_enabled != PalazzettiSettings.sync_clock) {
-        PalazzettiSettings.sync_clock = PlzJTimer.sync_clock_enabled;
+    if (PlzJTimer.sync_clock_enabled != PlzSettings.sync_clock) {
+        PlzSettings.sync_clock = PlzJTimer.sync_clock_enabled;
         PlzSettingsSave();  // Sauvegarder les settings mis à jour
-        AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Timesync setting updated to %d"), PlzJTimer.sync_clock_enabled);
-        Response_P(PSTR("{\"TIMESYNC_SETTING_UPDATED\":%d}"), PlzJTimer.sync_clock_enabled);  // Réponse en console
+        PlzSettingsPublish();
     }
 
     PlzJTimer.ecostart_mode_enabled = root.getBool("ecostart_mode_enabled", false); //flag_modalita_ecostart
     PlzJTimer.off_when_no_match = root.getBool("off_when_nomatch", true);
-    const char* last_edit = root.getStr("last_edit");
+    snprintf(PlzJTimer.last_edit, sizeof(PlzJTimer.last_edit), "%s", root.getStr("last_edit"));
     const char* appl_id = root.getStr("applid");
-    AddLog(LOG_LEVEL_INFO, PSTR("PLZ: ecostart_mode_enabled: %d, last_edit: %s, off_when_no_match: %d, appl_id: %d"), PlzJTimer.ecostart_mode_enabled, last_edit, PlzJTimer.off_when_no_match, appl_id);
+    AddLog(LOG_LEVEL_INFO, PSTR("PLZ: ecostart_mode_enabled: %d, last_edit: %s, off_when_no_match: %d, appl_id: %d"),
+        PlzJTimer.ecostart_mode_enabled, PlzJTimer.last_edit, PlzJTimer.off_when_no_match, appl_id);
 
     JsonParserToken scenariosToken = root["scenarios"];
     if (scenariosToken.isObject()) {
@@ -1599,8 +1675,8 @@ void PlzSetJTimer(const char *encoded_data) {
                     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: PlzGetScenarioIndex scenarioIdx: %d"), scenarioIdx);
 
                     int values[] = {
-                        scenarioSettings[scenarioIdx].setPoint, scenarioSettings[scenarioIdx].setPower, 
-                        scenarioSettings[scenarioIdx].setFan, scenarioSettings[scenarioIdx].setFan3, 
+                        scenarioSettings[scenarioIdx].setPoint, scenarioSettings[scenarioIdx].setPower,
+                        scenarioSettings[scenarioIdx].setFan, scenarioSettings[scenarioIdx].setFan3,
                         scenarioSettings[scenarioIdx].setFan4, scenarioSettings[scenarioIdx].setSilent
                     };
 
@@ -1670,16 +1746,16 @@ void PlzSetJTimer(const char *encoded_data) {
         } else {
             AddLog(LOG_LEVEL_ERROR, PSTR("PLZ: Failed to store rule"));
         }
-        snprintf(plzIJson.cmd, sizeof(plzIJson.cmd), PSTR("%s"), "settimer");
+        snprintf(PlzIJson.cmd, sizeof(PlzIJson.cmd), PSTR("%s"), "settimer");
     }
 
-    plzIJson.cmdRes = Palazzetti::CommandResult::OK;
-    snprintf_P(plzIJson.msg, sizeof(plzIJson.msg), PSTR("settimer OK"));
+    PlzIJson.cmdRes = Palazzetti::CommandResult::OK;
+    snprintf_P(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("settimer OK"));
 }
 
 void PlzGetCounters() {
-    plzIJson.cmdRes = pala.getCounters(&Plz.IGN, &Plz.POWERTIMEh, &Plz.POWERTIMEm, &Plz.HEATTIMEh, &Plz.HEATTIMEm, &Plz.SERVICETIMEh, &Plz.SERVICETIMEm, &Plz.ONTIMEh, &Plz.ONTIMEm, &Plz.OVERTMPERRORS, &Plz.IGNERRORS, &Plz.PQT);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.getCounters(&Plz.IGN, &Plz.POWERTIMEh, &Plz.POWERTIMEm, &Plz.HEATTIMEh, &Plz.HEATTIMEm, &Plz.SERVICETIMEh, &Plz.SERVICETIMEm, &Plz.ONTIMEh, &Plz.ONTIMEm, &Plz.OVERTMPERRORS, &Plz.IGNERRORS, &Plz.PQT);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddInt("IGN", Plz.IGN);
         char powerTimeStr[8];
         snprintf_P(powerTimeStr, sizeof(powerTimeStr), TIME_HOUR_MINUTE, Plz.POWERTIMEh, Plz.POWERTIMEm);
@@ -1700,24 +1776,24 @@ void PlzGetCounters() {
 }
 
 void PlzGetDateTime() {
-    plzIJson.cmdRes = pala.getDateTime(&Plz.STOVE_DATETIME, &Plz.STOVE_WDAY);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.getDateTime(&Plz.STOVE_DATETIME, &Plz.STOVE_WDAY);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddStr("STOVE_DATETIME", Plz.STOVE_DATETIME);
         PlzJSONAddInt("STOVE_WDAY", Plz.STOVE_WDAY);
     }
 }
 
 void PlzGetDPressData() {
-    plzIJson.cmdRes = pala.getDPressData(&Plz.DPT, &Plz.DP);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.getDPressData(&Plz.DPT, &Plz.DP);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddInt("DPT", Plz.DPT);
         PlzJSONAddInt("DP", Plz.DP);
     }
 }
 
 void PlzGetFanData() {
-    plzIJson.cmdRes = pala.getFanData(&Plz.F1V, &Plz.F2V, &Plz.F1RPM, &Plz.F2L, &Plz.F2LF, &Plz.isF3SF4SValid, &Plz.F3S, &Plz.F4S, &Plz.isF3LF4LValid, &Plz.F3L, &Plz.F4L);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.getFanData(&Plz.F1V, &Plz.F2V, &Plz.F1RPM, &Plz.F2L, &Plz.F2LF, &Plz.isF3SF4SValid, &Plz.F3S, &Plz.F4S, &Plz.isF3LF4LValid, &Plz.F3L, &Plz.F4L);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddInt("F1V", Plz.F1V);
         PlzJSONAddInt("F2V", Plz.F2V);
         PlzJSONAddInt("F1RPM", Plz.F1RPM);
@@ -1739,12 +1815,12 @@ void PlzGetHParamListData(const char *getHiddenParam, const char *prefix) {
     errno = 0;
     int getHiddenParamIndex = strtol(getHiddenParam, &endptr3, 10);
     if (checkStrtolError(getHiddenParam, endptr3)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
         return;
     }
     uint16_t getHiddenParamValue;
-    plzIJson.cmdRes = pala.getHiddenParameter(getHiddenParamIndex, &getHiddenParamValue);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.getHiddenParameter(getHiddenParamIndex, &getHiddenParamValue);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         char key[8];
         snprintf(key, sizeof(key), PSTR("%s%d"), prefix, getHiddenParamIndex);
         PlzJSONAddInt(key, getHiddenParamValue);
@@ -1752,8 +1828,8 @@ void PlzGetHParamListData(const char *getHiddenParam, const char *prefix) {
 }
 
 void PlzGetIO() {
-    plzIJson.cmdRes = pala.getIO(&Plz.IN_I01, &Plz.IN_I02, &Plz.IN_I03, &Plz.IN_I04, &Plz.OUT_O01, &Plz.OUT_O02, &Plz.OUT_O03, &Plz.OUT_O04, &Plz.OUT_O05, &Plz.OUT_O06, &Plz.OUT_O07);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.getIO(&Plz.IN_I01, &Plz.IN_I02, &Plz.IN_I03, &Plz.IN_I04, &Plz.OUT_O01, &Plz.OUT_O02, &Plz.OUT_O03, &Plz.OUT_O04, &Plz.OUT_O05, &Plz.OUT_O06, &Plz.OUT_O07);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddInt("IN_I01", Plz.IN_I01);
         PlzJSONAddInt("IN_I02", Plz.IN_I02);
         PlzJSONAddInt("IN_I03", Plz.IN_I03);
@@ -1769,7 +1845,7 @@ void PlzGetIO() {
 }
 
 void PlzGetLabel() {
-    plzIJson.cmdRes = Palazzetti::CommandResult::OK;
+    PlzIJson.cmdRes = Palazzetti::CommandResult::OK;
     PlzJSONAddStr("LABEL", NetworkHostname());
 }
 
@@ -1780,8 +1856,8 @@ void PlzGetLimMinListData() {
 }
 
 void PlzGetModelVersion() {
-    plzIJson.cmdRes = pala.getModelVersion(&Plz.MOD, &Plz.VER, &Plz.CORE, &Plz.FWDATE);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.getModelVersion(&Plz.MOD, &Plz.VER, &Plz.CORE, &Plz.FWDATE);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddInt("MOD", Plz.MOD);
         PlzJSONAddInt("VER", Plz.VER);
         PlzJSONAddInt("CORE", Plz.CORE);
@@ -1794,14 +1870,14 @@ void PlzGetParamListData(const char *getParam, const char *prefix) {
     errno = 0;
     int getParamIndex = strtol(getParam, &endptr0, 10);
     if (checkStrtolError(getParam, endptr0)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
         return;
     }
 
     byte getParamValue;
-    plzIJson.cmdRes = pala.getParameter(getParamIndex, &getParamValue);
+    PlzIJson.cmdRes = pala.getParameter(getParamIndex, &getParamValue);
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Commande getParameter param=%d value=%d"), getParamIndex, getParamValue);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         char key[8];
         snprintf(key, sizeof(key), PSTR("%s%d"), prefix, getParamIndex);
         PlzJSONAddInt(key, getParamValue);
@@ -1809,8 +1885,8 @@ void PlzGetParamListData(const char *getParam, const char *prefix) {
 }
 
 void PlzGetPower() {
-    plzIJson.cmdRes = pala.getPower(&Plz.PWR, &Plz.FDR);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.getPower(&Plz.PWR, &Plz.FDR);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddInt("PWR", Plz.PWR);
         PlzJSONAddFloat("FDR", Plz.FDR);
     }
@@ -1827,23 +1903,23 @@ int PlzGetScenarioIndex(const char* scenario) {
 }
 
 void PlzGetSetPoint() {
-    plzIJson.cmdRes = pala.getSetPoint(&Plz.SETP);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.getSetPoint(&Plz.SETP);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddFloat("SETP", Plz.SETP);
     }
 }
 
 void PlzGetSN() {
-    plzIJson.cmdRes = pala.getSN(&Plz.SN);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.getSN(&Plz.SN);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddStr("SN", "LT201629480580256025776");
         //JSONAddStr("SERN", Plz.SN);
     }
 }
 
 void PlzGetStaticData() {
-    plzIJson.cmdRes = pala.getStaticData(&Plz.SN, &Plz.SNCHK, &Plz.MBTYPE, &Plz.MOD, &Plz.VER, &Plz.CORE, &Plz.FWDATE, &Plz.FLUID, &Plz.SPLMIN, &Plz.SPLMAX, &Plz.UICONFIG, &Plz.HWTYPE, &Plz.DSPTYPE, &Plz.DSPFWVER, &Plz.CONFIG, &Plz.PELLETTYPE, &Plz.PSENSTYPE, &Plz.PSENSLMAX, &Plz.PSENSLTSH, &Plz.PSENSLMIN, &Plz.MAINTPROBE, &Plz.STOVETYPE, &Plz.FAN2TYPE, &Plz.FAN2MODE, &Plz.BLEMBMODE, &Plz.BLEDSPMODE, &Plz.CHRONOTYPE, &Plz.AUTONOMYTYPE, &Plz.NOMINALPWR);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.getStaticData(&Plz.SN, &Plz.SNCHK, &Plz.MBTYPE, &Plz.MOD, &Plz.VER, &Plz.CORE, &Plz.FWDATE, &Plz.FLUID, &Plz.SPLMIN, &Plz.SPLMAX, &Plz.UICONFIG, &Plz.HWTYPE, &Plz.DSPTYPE, &Plz.DSPFWVER, &Plz.CONFIG, &Plz.PELLETTYPE, &Plz.PSENSTYPE, &Plz.PSENSLMAX, &Plz.PSENSLTSH, &Plz.PSENSLMIN, &Plz.MAINTPROBE, &Plz.STOVETYPE, &Plz.FAN2TYPE, &Plz.FAN2MODE, &Plz.BLEMBMODE, &Plz.BLEDSPMODE, &Plz.CHRONOTYPE, &Plz.AUTONOMYTYPE, &Plz.NOMINALPWR);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddStr("LABEL", NetworkHostname());
         PlzJSONAddStr("GWDEVICE", "wlan0");
         PlzJSONAddStr("MAC", WiFi.macAddress().c_str());
@@ -1926,8 +2002,8 @@ void PlzGetStaticData() {
 }
 
 void PlzGetStatus() {
-    plzIJson.cmdRes = pala.getStatus(&Plz.STATUS, &Plz.LSTATUS, &Plz.FSTATUS);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.getStatus(&Plz.STATUS, &Plz.LSTATUS, &Plz.FSTATUS);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddInt("STATUS", Plz.STATUS);
         PlzJSONAddInt("LSTATUS", Plz.LSTATUS);
         PlzJSONAddInt("FSTATUS", Plz.FSTATUS);
@@ -1935,18 +2011,18 @@ void PlzGetStatus() {
 }
 
 void PlzInitJSON() {
-    plzIJson.cmdRes = Palazzetti::CommandResult::ERROR;
-    memset(plzIJson.data, 0, sizeof(plzIJson.data));
-    memset(plzIJson.info, 0, sizeof(plzIJson.info));
-    memset(plzIJson.full, 0, sizeof(plzIJson.full));
-    memset(plzIJson.msg, 0, sizeof(plzIJson.msg));
-    memset(plzIJson.cmd, 0, sizeof(plzIJson.cmd));
-    plzIJson.ts = 0;
-    plzIJson.success = false;
+    PlzIJson.cmdRes = Palazzetti::CommandResult::ERROR;
+    memset(PlzIJson.data, 0, sizeof(PlzIJson.data));
+    memset(PlzIJson.info, 0, sizeof(PlzIJson.info));
+    memset(PlzIJson.full, 0, sizeof(PlzIJson.full));
+    memset(PlzIJson.msg, 0, sizeof(PlzIJson.msg));
+    memset(PlzIJson.cmd, 0, sizeof(PlzIJson.cmd));
+    PlzIJson.ts = 0;
+    PlzIJson.success = false;
 }
 
 bool PlzParser() {
-    const char* cmd = plzRequest.commandData;
+    const char* cmd = PlzRequest.command_data;
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Commande PlzParser cmd=%s"), cmd);
 
     char cmdCopy[1024];
@@ -1955,72 +2031,71 @@ bool PlzParser() {
     while (*start == ' ') {
         start++;
     }
-    if (!plzRequest.isPost) {
+    if (!PlzRequest.is_post) {
         for (char &c : cmdCopy) c = toupper(c);
     }
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Commande PlzParser filtered cmd=%s"), cmdCopy);
 
     PlzInitJSON();
-    snprintf(plzIJson.cmd, sizeof(plzIJson.cmd), PSTR("%s"), cmdCopy);
+    snprintf(PlzIJson.cmd, sizeof(PlzIJson.cmd), PSTR("%s"), cmdCopy);
+    PlzIJson.cmdRes = Palazzetti::CommandResult::COMMUNICATION_ERROR;
 
-    plzIJson.cmdRes = Palazzetti::CommandResult::COMMUNICATION_ERROR;
-
-    if (plzRequest.isGet || plzRequest.isUdp) {
+    if (PlzRequest.is_get || PlzRequest.is_udp) {
         PlzJSONAddObj("DATA");
     }
     if (strncasecmp(cmdCopy, "GET ", 4) == 0) {
-        plzIJson.success = PlzParserGET(cmdCopy + 4);
+        PlzIJson.success = PlzParserGET(cmdCopy + 4);
     } else if (strncasecmp(cmdCopy, "SET ", 4) == 0) {
-        plzIJson.success = PlzParserSET(cmdCopy + 4);
+        PlzIJson.success = PlzParserSET(cmdCopy + 4);
     } else if (strncasecmp(cmdCopy, "CMD ", 4) == 0) {
-        plzIJson.success = PlzParserCMD(cmdCopy + 4);
+        PlzIJson.success = PlzParserCMD(cmdCopy + 4);
     } else if (strncasecmp(cmdCopy, "BKP ", 4) == 0) {
-        plzIJson.success = PlzParserBKP(cmdCopy + 4);
+        PlzIJson.success = PlzParserBKP(cmdCopy + 4);
     } else if (strncasecmp(cmdCopy, "EXT ", 4) == 0) {
-        plzIJson.success = PlzParserEXT(cmdCopy + 4);
+        PlzIJson.success = PlzParserEXT(cmdCopy + 4);
     } else {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
-        snprintf_P(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Unknown command received: %s"), cmdCopy);
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        snprintf_P(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Unknown command received: %s"), cmdCopy);
     }
 
-    if (plzIJson.success) {
-        plzRequest.isConnected = true;
+    if (PlzIJson.success) {
+        PlzRequest.is_connected = true;
     }
 
-    if (plzRequest.isGet || plzRequest.isUdp || plzRequest.isPost) {
-        if (!plzIJson.success) {
-            PlzJSONAddBool("NODATA", !plzIJson.success);
-            if (!plzIJson.msg) {
-                snprintf_P(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Stove communication failed"));
+    if (PlzRequest.is_get || PlzRequest.is_udp || PlzRequest.is_post) {
+        if (!PlzIJson.success) {
+            PlzJSONAddBool("NODATA", !PlzIJson.success);
+            if (!PlzIJson.msg) {
+                snprintf_P(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Stove communication failed"));
             }
         }
         PlzJSONCloseObj();
     }
 
-    if (plzRequest.isGet || plzRequest.isUdp) {
+    if (PlzRequest.is_get || PlzRequest.is_udp) {
         PlzJSONAddComma();
-        PlzJSONAddBool("SUCCESS", plzIJson.success);
-        PlzJSONRemoveComma(plzIJson.data);
+        PlzJSONAddBool("SUCCESS", PlzIJson.success);
+        PlzJSONRemoveComma(PlzIJson.data);
 
         if (strncasecmp(cmdCopy, "BKP ", 4) == 0) {
             char attachment[100];
             snprintf_P(attachment, sizeof(attachment), PSTR("attachment; filename=%s.%s"), cmdCopy + 4, cmdCopy + 9);
             Webserver->sendHeader(F("Content-Disposition"), attachment);
-            
-            const char* parmStart = strstr(plzIJson.data, "\"DATA\":{"); // Pour CSV
+
+            const char* parmStart = strstr(PlzIJson.data, "\"DATA\":{"); // Pour CSV
             if (parmStart != nullptr) {
-                parmStart += 8;  // Ajuste le point de départ pour inclure seulement "PARM" et son contenu
+                parmStart += 8;
                 const char* parmEnd = strstr(parmStart, ",\"SUCCESS\"");
 
                 if (parmEnd != nullptr) {
-                    int startIndex = parmStart - plzIJson.data;
-                    int endIndex = parmEnd - plzIJson.data;
+                    int startIndex = parmStart - PlzIJson.data;
+                    int endIndex = parmEnd - PlzIJson.data;
 
                     if (strncmp(cmdCopy + 9, "CSV", 3) == 0) {
-                        WSSend(200, CT_PLAIN, String(plzIJson.data).substring(startIndex, endIndex - 1));
-                        snprintf_P(plzIJson.data, sizeof(plzIJson.data), PSTR("\"%s\""), RemoveSpace(plzIJson.data));
+                        WSSend(200, CT_PLAIN, String(PlzIJson.data).substring(startIndex, endIndex - 1));
+                        snprintf_P(PlzIJson.data, sizeof(PlzIJson.data), PSTR("\"%s\""), RemoveSpace(PlzIJson.data));
                     } else if (strncmp(cmdCopy + 9, "JSON", 4) == 0) {
-                        WSSend(200, CT_APP_JSON, String(plzIJson.data).substring(startIndex - 1, endIndex));
+                        WSSend(200, CT_APP_JSON, String(PlzIJson.data).substring(startIndex - 1, endIndex));
                     }
                 } else {
                     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: BKP end data not found"));
@@ -2030,28 +2105,25 @@ bool PlzParser() {
             }
         }
 
-        plzIJson.ts = getTimeStamp();
+        PlzIJson.ts = getTimeStamp();
         PlzJSONMerge();
         if (strncasecmp(cmdCopy, "BKP ", 4) != 0) {
-            WSSend(200, CT_APP_JSON, plzIJson.full);
+            WSSend(200, CT_APP_JSON, PlzIJson.full);
         }
-        AddLog(LOG_LEVEL_INFO, PSTR("PLZ: PlzParser1 Commande response=%s"), plzIJson.full);
-        plzRequest.isGet = false;
-        plzRequest.isUdp = false;
+        AddLog(LOG_LEVEL_INFO, PSTR("PLZ: PlzParser1 Commande response=%s"), PlzIJson.full);
+        PlzRequest.is_get = false;
+        PlzRequest.is_udp = false;
     }
 
-    const uint32_t mqttPrefix = TELE;
-    char mqttTopic[128];
-    if (PalazzettiSettings.mqtt_topic == 1) {
-        plzIJson.ts = getTimeStamp();
+    if (PlzSettings.mqtt_topic == 1) {
+        PlzIJson.ts = getTimeStamp();
         PlzJSONMerge();
 
-        snprintf(mqttTopic, sizeof(mqttTopic), "%s", cmdCopy);
-        Response_P(PSTR("%s"), plzIJson.full);
-        MqttPublishPrefixTopicRulesProcess_P(mqttPrefix, mqttTopic);
-
-    } else if (PalazzettiSettings.mqtt_topic == 0 || PalazzettiSettings.mqtt_topic == 2) {
-        char *keyStart = strstr(plzIJson.data, "{");
+        ResponseClear();
+        Response_P(PSTR("%s"), PlzIJson.full);
+        MqttPublishPrefixTopicRulesProcess_P(TELE, cmdCopy);
+    } else if (PlzSettings.mqtt_topic == 0 || PlzSettings.mqtt_topic == 2) {
+        char *keyStart = strstr(PlzIJson.data, "{");
         while (keyStart) {
             keyStart = strchr(keyStart, '"');
             if (!keyStart) break;
@@ -2070,7 +2142,7 @@ bool PlzParser() {
                 valueEnd = strchr(valueStart, '"');
             } else if (*valueStart == '[') {
                 valueStart++;
-                valueEnd = strchr(valueStart, ']'); 
+                valueEnd = strchr(valueStart, ']');
             } else {
                 valueEnd = valueStart;
                 while (*valueEnd && *valueEnd != ',' && *valueEnd != '}') valueEnd++;
@@ -2078,44 +2150,45 @@ bool PlzParser() {
             if (!valueEnd) break;
             *valueEnd = '\0';
 
-            if (PalazzettiSettings.mqtt_topic == 0) {
+            char mqttTopic[128];
+            if (PlzSettings.mqtt_topic == 0) {
                 snprintf(mqttTopic, sizeof(mqttTopic), "%s", keyStart + 1);
-            } else if (PalazzettiSettings.mqtt_topic == 2) {
+            } else if (PlzSettings.mqtt_topic == 2) {
                 snprintf(mqttTopic, sizeof(mqttTopic), "%s/%s", cmdCopy, keyStart + 1);
             }
-               
+
             AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Publishing MQTT: topic=%s, valueS=%s, localCmd=%s, keyStart+1=%s"), mqttTopic, valueStart, cmdCopy, keyStart + 1);
             Response_P(PSTR("%s"), valueStart);
-            MqttPublishPrefixTopicRulesProcess_P(mqttPrefix, mqttTopic);
+            MqttPublishPrefixTopicRulesProcess_P(TELE, mqttTopic);
 
             keyStart = valueEnd + 1;
         }
-        Response_P(PSTR("%s"), plzIJson.cmd);
-        if (PalazzettiSettings.mqtt_topic == 0) {
-            MqttPublishPrefixTopicRulesProcess_P(mqttPrefix, JSON_CMD);
-        } else if (PalazzettiSettings.mqtt_topic == 2) {
-            MqttPublishPrefixTopicRulesProcess_P(mqttPrefix, "INFO/CMD");
+        Response_P(PSTR("%s"), PlzIJson.cmd);
+        if (PlzSettings.mqtt_topic == 0) {
+            MqttPublishPrefixTopicRulesProcess_P(TELE, JSON_CMD);
+        } else if (PlzSettings.mqtt_topic == 2) {
+            MqttPublishPrefixTopicRulesProcess_P(TELE, "INFO/CMD");
         }
-        if (plzIJson.ts > 0) {
-            Response_P(PSTR("%u"), plzIJson.ts);
-            if (PalazzettiSettings.mqtt_topic == 0) {
-                MqttPublishPrefixTopicRulesProcess_P(mqttPrefix, JSON_TS);
-            } else if (PalazzettiSettings.mqtt_topic == 2) {
-                MqttPublishPrefixTopicRulesProcess_P(mqttPrefix, "INFO/TS");
+        if (PlzIJson.ts > 0) {
+            Response_P(PSTR("%u"), PlzIJson.ts);
+            if (PlzSettings.mqtt_topic == 0) {
+                MqttPublishPrefixTopicRulesProcess_P(TELE, JSON_TS);
+            } else if (PlzSettings.mqtt_topic == 2) {
+                MqttPublishPrefixTopicRulesProcess_P(TELE, "INFO/TS");
             }
         }
         Response_P(PSTR("%s"), commandResultToString());
-        if (PalazzettiSettings.mqtt_topic == 0) {
-            MqttPublishPrefixTopicRulesProcess_P(mqttPrefix, JSON_RSP);
-        } else if (PalazzettiSettings.mqtt_topic == 2) {
-            MqttPublishPrefixTopicRulesProcess_P(mqttPrefix, "INFO/RSP");
+        if (PlzSettings.mqtt_topic == 0) {
+            MqttPublishPrefixTopicRulesProcess_P(TELE, JSON_RSP);
+        } else if (PlzSettings.mqtt_topic == 2) {
+            MqttPublishPrefixTopicRulesProcess_P(TELE, "INFO/RSP");
         }
-    } 
-    return plzIJson.success;
+    }
+    return PlzIJson.success;
 }
 
 bool PlzParserGET(char* cmnd) {
-    plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+    PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Commande reçue cmnd=%s"), cmnd);
     if (strncmp(cmnd, "ALLS", 4) == 0 || strncmp(cmnd, "LALL", 4) == 0 || strncmp(cmnd, "JALL", 4) == 0) {
         PlzGetAllStatus();
@@ -2157,7 +2230,7 @@ bool PlzParserGET(char* cmnd) {
     } else if (strncmp(cmnd, "HPAR", 4) == 0) {
         PlzGetHParamListData(cmnd + 5, "HPAR");
     }
-    return (plzIJson.cmdRes == Palazzetti::CommandResult::OK);
+    return (PlzIJson.cmdRes == Palazzetti::CommandResult::OK);
 }
 
 bool PlzParserSET(char* cmnd) {
@@ -2178,7 +2251,7 @@ bool PlzParserSET(char* cmnd) {
         strcpy(cmnd, "FAND");
     } else if (strncmp(cmnd, "JTMR", 4) == 0) {
         PlzSetJTimer(cmnd + 5);
-        PlzJSONAddBool("NODATA", (plzIJson.cmdRes == Palazzetti::CommandResult::OK));
+        PlzJSONAddBool("NODATA", (PlzIJson.cmdRes == Palazzetti::CommandResult::OK));
     } else if (strncmp(cmnd, "SLNT", 4) == 0) {
         PlzSetSilentMode(cmnd + 5);
     } else if (strncmp(cmnd, "POWR", 4) == 0) {
@@ -2202,6 +2275,7 @@ bool PlzParserSET(char* cmnd) {
         strcpy(cmnd, "SETP");
     } else if (strncmp(cmnd, "TIME", 4) == 0) {
         PlzSetDateTime(cmnd + 5);
+        strcpy(cmnd, "TIME");
     } else if (strncmp(cmnd, "CPRD", 4) == 0) {
         PlzSetChronoPrg(cmnd + 5);
         strcpy(cmnd, "CHRSTATUS");
@@ -2241,7 +2315,7 @@ bool PlzParserSET(char* cmnd) {
         PlzSetSN(cmnd + 5);
      }
 
-    return (plzIJson.cmdRes == Palazzetti::CommandResult::OK);
+    return (PlzIJson.cmdRes == Palazzetti::CommandResult::OK);
 }
 
 bool PlzParserCMD(char* cmnd) {
@@ -2252,7 +2326,7 @@ bool PlzParserCMD(char* cmnd) {
         PlzSetSwitchOff();
         strcpy(cmnd, "STAT");
     }
-    return (plzIJson.cmdRes == Palazzetti::CommandResult::OK);
+    return (PlzIJson.cmdRes == Palazzetti::CommandResult::OK);
 }
 
 bool PlzParserBKP(char* cmnd) {
@@ -2262,7 +2336,7 @@ bool PlzParserBKP(char* cmnd) {
     } else if (strncmp(cmnd, "HPAR", 4) == 0) {
         PlzGetAllHiddenParameters(cmnd);
     }
-    return (plzIJson.cmdRes == Palazzetti::CommandResult::OK);
+    return (PlzIJson.cmdRes == Palazzetti::CommandResult::OK);
 }
 
 bool PlzParserEXT(char* cmnd) {
@@ -2284,7 +2358,7 @@ bool PlzParserEXT(char* cmnd) {
     }
     //
     //LMNL
-    return (plzIJson.cmdRes == Palazzetti::CommandResult::OK);
+    return (PlzIJson.cmdRes == Palazzetti::CommandResult::OK);
 }
 
 void PlzReadData(const char *cmd) {
@@ -2294,14 +2368,14 @@ void PlzReadData(const char *cmd) {
     int value = strtol(cmd + 5, &endptr, 10);
 
     if (checkStrtolError(cmd, endptr) || checkStrtolError(cmd + 5, endptr)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing key or value PlzReadData"));
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing key or value PlzReadData"));
         return;
     }
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Commande PlzReadData hex=%d, value=%d"), hex, value);
 
-    plzIJson.cmdRes = pala.readData(hex, value, &Plz.ADDR_DATA);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.readData(hex, value, &Plz.ADDR_DATA);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         char key[10];
         snprintf_P(key, sizeof(key), PSTR("ADDR_%04X"), hex % 0x10000);
         PlzJSONAddStr("DATATYPE", (value > 0 ? "WORD" : "BYTE"));
@@ -2317,13 +2391,13 @@ void PlzSetChronoDay(const char* cmd) {
     int program = strtol(cmd + 4, &endptr, 10);
 
     if (checkStrtolError(cmd, endptr) || checkStrtolError(cmd + 2, endptr) || checkStrtolError(cmd + 4, endptr)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing day or program data for setChronoDay"));
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing day or program data for setChronoDay"));
         return;
     }
 
-    plzIJson.cmdRes = pala.setChronoDay(day, memory, program);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setChronoDay(day, memory, program);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         char dayName[3] = {'D', static_cast<char>(day + '0'), '\0'};
         char memoryName[3] = {'M', static_cast<char>(memory + '0'), '\0'};
         char programName[3] = {'P', static_cast<char>(program + '0'), '\0'};
@@ -2353,13 +2427,13 @@ void PlzSetChronoPrg(const char* cmd) {
     if (checkStrtolError(cmd, endptr) || checkStrtolError(cmd + 3, endptr) ||
         checkStrtolError(cmd + 8, endptr) || checkStrtolError(cmd + 12, endptr) ||
         checkStrtolError(cmd + 15, endptr) || checkStrtolError(cmd + 18, endptr)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing chrono program data for setChronoPrg"));
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing chrono program data for setChronoPrg"));
         return;
     }
 
-    plzIJson.cmdRes = pala.setChronoPrg(program, setpoint, startHour, startMinute, stopHour, stopMinute);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setChronoPrg(program, setpoint, startHour, startMinute, stopHour, stopMinute);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         char programName[3] = {'P', static_cast<char>(program + '0'), '\0'};
         float chrsetp = static_cast<float>(setpoint) / 10.0f; // Assuming setpoint is in tenths
 
@@ -2384,13 +2458,13 @@ void PlzSetChronoSetpoint(const char* cmd) {
     int setpoint = strtol(cmd + 2, &endptr, 10);
 
     if (checkStrtolError(cmd, endptr) || checkStrtolError(cmd + 3, endptr)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing setpoint for setChronoSetpoint"));
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing setpoint for setChronoSetpoint"));
         return;
     }
 
-    plzIJson.cmdRes = pala.setChronoSetpoint(programNumber, setpoint);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setChronoSetpoint(programNumber, setpoint);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddStr("Result", "OK");
     }
 }
@@ -2405,12 +2479,12 @@ return;
 //ESP-PLZ: Commande getParameter programNumber=8, startMinute=8
 
     if (checkStrtolError(cmd, endptr) || checkStrtolError(cmd + 2, endptr)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing start hour for setChronoStartHH"));
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing start hour for setChronoStartHH"));
         return;
     }
-    plzIJson.cmdRes = pala.setChronoStartHH(programNumber, startHour);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setChronoStartHH(programNumber, startHour);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddStr("Result", "OK");
     }
 }
@@ -2422,13 +2496,13 @@ void PlzSetChronoStartMM(const char* cmd) {
     int startMinute = strtol(cmd + 2, &endptr, 10);
 
     if (checkStrtolError(cmd, endptr) || checkStrtolError(cmd + 2, endptr)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing start minute for setChronoStartMM"));
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing start minute for setChronoStartMM"));
         return;
     }
 
-    plzIJson.cmdRes = pala.setChronoStartMM(programNumber, startMinute);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setChronoStartMM(programNumber, startMinute);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddStr("Result", "OK");
     }
 }
@@ -2439,14 +2513,14 @@ void PlzSetChronoStatus(const char* cmd) {
     int status = strtol(cmd, &endptr, 10);
 
     if (checkStrtolError(cmd, endptr)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing status for setChronoStatus"));
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing status for setChronoStatus"));
         return;
     }
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Commande PlzSetChronoStatus cmdStr=%d"), status);
 
-    plzIJson.cmdRes = pala.setChronoStatus(status, &Plz.CHRSTATUS);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setChronoStatus(status, &Plz.CHRSTATUS);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddInt("CHRSTATUS", Plz.CHRSTATUS);
     }
 }
@@ -2458,13 +2532,13 @@ void PlzSetChronoStopHH(const char* cmd) {
     int stopHour = strtol(cmd + 2, &endptr, 10);
 
     if (checkStrtolError(cmd, endptr) || checkStrtolError(cmd + 2, endptr)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing stop hour for setChronoStopHH"));
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing stop hour for setChronoStopHH"));
         return;
     }
 
-    plzIJson.cmdRes = pala.setChronoStopHH(programNumber, stopHour);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setChronoStopHH(programNumber, stopHour);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddStr("Result", "OK");
     }
 }
@@ -2476,60 +2550,60 @@ void PlzSetChronoStopMM(const char* cmd) {
     int stopMinute = strtol(cmd + 2, &endptr, 10);
 
     if (checkStrtolError(cmd, endptr) || checkStrtolError(cmd + 2, endptr)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing stop minute for setChronoStopMM"));
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing stop minute for setChronoStopMM"));
         return;
     }
 
-    plzIJson.cmdRes = pala.setChronoStopMM(programNumber, stopMinute);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setChronoStopMM(programNumber, stopMinute);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddStr("Result", "OK");
     }
 }
 
 void PlzSetDateTime(const char* cmd) {
     char* endptr = nullptr;
-    errno = 0;
+    AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Commande setDateTime cmd=%s"), cmd);
     int year = strtol(cmd, &endptr, 10); // Extraction de l'année
     errno = 0;
     if (checkStrtolError(cmd, endptr)) {
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing Year"));
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing Year"));
         return;
     }
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Commande setDateTime year=%d"), year);
-    
+
     int month = strtol(endptr + 1, &endptr, 10); // Extraction du mois
     errno = 0;
     if (checkStrtolError(endptr + 1, endptr)) {
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing Month"));
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing Month"));
         return;
     }
-    
+
     int day = strtol(endptr + 1, &endptr, 10); // Extraction du jour
     errno = 0;
     if (checkStrtolError(endptr + 1, endptr)) {
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing Day"));
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing Day"));
         return;
     }
-    
+
     int hour = strtol(endptr + 1, &endptr, 10); // Extraction de l'heure
     errno = 0;
     if (checkStrtolError(endptr + 1, endptr)) {
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing Hour"));
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing Hour"));
         return;
     }
-    
+
     int minute = strtol(endptr + 1, &endptr, 10); // Extraction de la minute
     errno = 0;
     if (checkStrtolError(endptr + 1, endptr)) {
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing Minute"));
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing Minute"));
         return;
     }
-    
+
     int second = strtol(endptr + 1, nullptr, 10); // Extraction de la seconde
     errno = 0;
     if (checkStrtolError(endptr + 1, nullptr)) {
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing Second"));
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing Second"));
         return;
     }
 
@@ -2537,34 +2611,34 @@ void PlzSetDateTime(const char* cmd) {
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: setDateTime year=%d, month=%d, day=%d, hour=%d, minute=%d, second=%d"), year, month, day, hour, minute, second);
 
     if (year < 2000 || year > 2099) {
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Incorrect Year"));
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Incorrect Year"));
         return;
     }
     if (month < 1 || month > 12) {
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Incorrect Month"));
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Incorrect Month"));
         return;
     }
     bool isLeapYear = ((year % 4 == 0) && (year % 100 != 0)) || (year % 400 == 0);
     int maxDay = (month == 2) ? (isLeapYear ? 29 : 28) : (31 - (month - 1) % 7 % 2);
     if (day < 1 || day > maxDay) {
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Incorrect Day"));
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Incorrect Day"));
         return;
     }
     if (hour < 0 || hour > 23) {
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Incorrect Hour"));
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Incorrect Hour"));
         return;
     }
     if (minute < 0 || minute > 59) {
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Incorrect Minute"));
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Incorrect Minute"));
         return;
     }
     if (second < 0 || second > 59) {
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Incorrect Second"));
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Incorrect Second"));
         return;
     }
 
-    plzIJson.cmdRes = pala.setDateTime(year, month, day, hour, minute, second, &Plz.STOVE_DATETIME, &Plz.STOVE_WDAY);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setDateTime(year, month, day, hour, minute, second, &Plz.STOVE_DATETIME, &Plz.STOVE_WDAY);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddStr("STOVE_DATETIME", Plz.STOVE_DATETIME);
         PlzJSONAddInt("STOVE_WDAY", Plz.STOVE_WDAY);
     }
@@ -2576,7 +2650,7 @@ void PlzSetHiddenParameter(const char *setHiddenParam, const char *prefix) {
     errno = 0;
     int setHiddenParamIndex = strtol(setHiddenParam, &endptr4, 10);
     if (checkStrtolError(setHiddenParam, endptr4)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
         return;
     }
 
@@ -2584,12 +2658,12 @@ void PlzSetHiddenParameter(const char *setHiddenParam, const char *prefix) {
     errno = 0;
     int setHiddenParamValue = strtol(endptr4, &endptr5, 10);
     if (checkStrtolError(endptr4, endptr5)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
         return;
     }
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Commande setHiddenParameter index=%d value=%d"), setHiddenParamIndex, setHiddenParamValue);
-    plzIJson.cmdRes = pala.setHiddenParameter(setHiddenParamIndex, setHiddenParamValue);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setHiddenParameter(setHiddenParamIndex, setHiddenParamValue);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         char key[8];
         snprintf(key, sizeof(key), "%s%d", prefix, setHiddenParamIndex);
         PlzJSONAddInt(key, setHiddenParamValue);
@@ -2598,13 +2672,13 @@ void PlzSetHiddenParameter(const char *setHiddenParam, const char *prefix) {
 
 void PlzSetLabel(const char *setLabelParam) {
     if (strlen(setLabelParam) < 33) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::OK;
+        PlzIJson.cmdRes = Palazzetti::CommandResult::OK;
         PlzJSONAddStr("LABEL", setLabelParam);
         SettingsUpdateText(SET_HOSTNAME, setLabelParam);
         TasmotaGlobal.restart_flag = 2;
     } else {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Label too long"));
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Label too long"));
     }
 }
 
@@ -2614,7 +2688,7 @@ void PlzSetParameter(const char *setParam, const char *prefix) {
     errno = 0;
     int setParamIndex = strtol(setParam, &endptr1, 10);
     if (checkStrtolError(setParam, endptr1)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
         return;
     }
 
@@ -2624,12 +2698,12 @@ void PlzSetParameter(const char *setParam, const char *prefix) {
     if (checkStrtolError(endptr1, endptr2)) {
     //int32_t setParamValue = strtol(endptr1, &endptr2, 10);
     //if (setParamValue == 0 == errno == 0) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
         return;
     }
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Commande setParameter index=%d value=%d"), setParamIndex, setParamValue);
-    plzIJson.cmdRes = pala.setParameter(setParamIndex, setParamValue);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setParameter(setParamIndex, setParamValue);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         char key[8];
         snprintf(key, sizeof(key), "%s%d", prefix, setParamIndex);
         PlzJSONAddInt(key, setParamValue);
@@ -2641,12 +2715,12 @@ void PlzSetPower(const char *setPowerLevel) {
     errno = 0;
     int powerLevel = strtol(setPowerLevel, &endptr, 10);
     if (checkStrtolError(setPowerLevel, endptr)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
         return;
     }
 
-    plzIJson.cmdRes = pala.setPower(static_cast<byte>(powerLevel), &Plz.PWR, &Plz.isF2LValid, &Plz.F2L, &Plz.FANLMINMAX);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setPower(static_cast<byte>(powerLevel), &Plz.PWR, &Plz.isF2LValid, &Plz.F2L, &Plz.FANLMINMAX);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddInt("PWR", Plz.PWR);
         if (Plz.isF2LValid) {
             PlzJSONAddInt("F2L", Plz.F2L);
@@ -2655,9 +2729,36 @@ void PlzSetPower(const char *setPowerLevel) {
     }
 }
 
+bool PlzSetPowerBtn(void)
+{
+    bool status = false;
+    bool hasSwitch = (Plz.STOVETYPE != 7 && Plz.STOVETYPE != 8);
+    bool isStarted = (Plz.LSTATUS == 0 || Plz.LSTATUS == 1 || Plz.LSTATUS == 6 || Plz.LSTATUS == 7 || Plz.LSTATUS == 9
+                    || Plz.LSTATUS == 11 || Plz.LSTATUS == 12 || Plz.LSTATUS == 51 || Plz.LSTATUS == 501 || Plz.LSTATUS == 504
+                    || Plz.LSTATUS == 505 || Plz.LSTATUS == 506 || Plz.LSTATUS == 507);
+
+    AddLog(LOG_LEVEL_INFO, PSTR("activedevice %d"), TasmotaGlobal.active_device);
+
+    if (XdrvMailbox.payload != SRC_SWITCH && plzSerial && hasSwitch) {  // ignore to prevent loop from pushing state from faceplate interaction
+        if (TasmotaGlobal.power != isStarted) {
+            char cmdBuffer[32] = { 0 };
+            if (TasmotaGlobal.power) {
+                snprintf(cmdBuffer, sizeof(cmdBuffer), "Palazzetti sendmsg CMD ON");
+                ExecuteCommand(cmdBuffer, SRC_WEBCONSOLE);
+            } else {
+                snprintf(cmdBuffer, sizeof(cmdBuffer), "Palazzetti sendmsg CMD OFF");
+                ExecuteCommand(cmdBuffer, SRC_WEBCONSOLE);
+            }
+            status = true;
+        }
+        AddLog(LOG_LEVEL_INFO, PSTR("bitRead %d"),(bitRead(XdrvMailbox.index, TasmotaGlobal.active_device-1) ^ bitRead(TasmotaGlobal.rel_inverted, TasmotaGlobal.active_device-1)));
+    }
+    return status;
+}
+
 void PlzSetPowerDown() {
-    plzIJson.cmdRes = pala.setPowerDown(&Plz.PWR, &Plz.isF2LValid, &Plz.F2L, &Plz.FANLMINMAX);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setPowerDown(&Plz.PWR, &Plz.isF2LValid, &Plz.F2L, &Plz.FANLMINMAX);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddInt("PWR", Plz.PWR);
         if (Plz.isF2LValid) {
             PlzJSONAddInt("F2L", Plz.F2L);
@@ -2667,8 +2768,8 @@ void PlzSetPowerDown() {
 }
 
 void PlzSetPowerUp() {
-    plzIJson.cmdRes = pala.setPowerUp(&Plz.PWR, &Plz.isF2LValid, &Plz.F2L, &Plz.FANLMINMAX);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setPowerUp(&Plz.PWR, &Plz.isF2LValid, &Plz.F2L, &Plz.FANLMINMAX);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddInt("PWR", Plz.PWR);
         if (Plz.isF2LValid) {
             PlzJSONAddInt("F2L", Plz.F2L);
@@ -2683,13 +2784,13 @@ void PlzSetRoomFan(const char *setRoomFan) {
     int fanLevel = strtol(setRoomFan, &endptr, 10); // Extraction de la valeur de fanLevel
 
     if (checkStrtolError(setRoomFan, endptr)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing fan level for setRoomFan"));
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing fan level for setRoomFan"));
         return;
     }
 
-    plzIJson.cmdRes = pala.setRoomFan(fanLevel, &Plz.isPWRValid, &Plz.PWR, &Plz.F2L, &Plz.F2LF);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setRoomFan(fanLevel, &Plz.isPWRValid, &Plz.PWR, &Plz.F2L, &Plz.F2LF);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         if (Plz.isPWRValid) {
             PlzJSONAddInt("PWR", Plz.PWR);
         }
@@ -2704,13 +2805,13 @@ void PlzSetRoomFan3(const char *cmd) {
     int fanLevel = strtol(cmd, &endptr, 10); // Extraction de la valeur de fanLevel
 
     if (checkStrtolError(cmd, endptr)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing fan level for setRoomFan3"));
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing fan level for setRoomFan3"));
         return;
     }
 
-    plzIJson.cmdRes = pala.setRoomFan3(fanLevel, &Plz.F3L);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setRoomFan3(fanLevel, &Plz.F3L);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddInt("F3L", Plz.F3L);
     }
 }
@@ -2721,20 +2822,20 @@ void PlzSetRoomFan4(const char *cmd) {
     int fanLevel = strtol(cmd, &endptr, 10); // Extraction de la valeur de fanLevel
 
     if (checkStrtolError(cmd, endptr)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing fan level for setRoomFan4"));
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing fan level for setRoomFan4"));
         return;
     }
 
-    plzIJson.cmdRes = pala.setRoomFan4(fanLevel, &Plz.F4L);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setRoomFan4(fanLevel, &Plz.F4L);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddInt("F4L", Plz.F4L);
     }
 }
 
 void PlzSetRoomFanDown() {
-    plzIJson.cmdRes = pala.setRoomFanDown(&Plz.isPWRValid, &Plz.PWR, &Plz.F2L, &Plz.F2LF);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setRoomFanDown(&Plz.isPWRValid, &Plz.PWR, &Plz.F2L, &Plz.F2LF);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         if (Plz.isPWRValid) {
             PlzJSONAddInt("PWR", Plz.PWR);
         }
@@ -2744,8 +2845,8 @@ void PlzSetRoomFanDown() {
 }
 
 void PlzSetRoomFanUp() {
-    plzIJson.cmdRes = pala.setRoomFanUp(&Plz.isPWRValid, &Plz.PWR, &Plz.F2L, &Plz.F2LF);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setRoomFanUp(&Plz.isPWRValid, &Plz.PWR, &Plz.F2L, &Plz.F2LF);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         if (Plz.isPWRValid) {
             PlzJSONAddInt("PWR", Plz.PWR);
         }
@@ -2759,19 +2860,19 @@ void PlzSetSetPoint(const char *setSetPoint) {
     errno = 0;
     int setSetPointValue = strtol(setSetPoint, &endptr5, 10);
     if (checkStrtolError(setSetPoint, endptr5)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
         return;
     }
 
-    plzIJson.cmdRes = pala.setSetpoint(static_cast<byte>(setSetPointValue), &Plz.SETP);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setSetpoint(static_cast<byte>(setSetPointValue), &Plz.SETP);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddFloat("SETP", Plz.SETP);
     }
 }
 
 void PlzSetSetPointDown() {
-    plzIJson.cmdRes = pala.setSetPointDown(&Plz.SETP);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setSetPointDown(&Plz.SETP);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddFloat("SETP", Plz.SETP);
     }
 }
@@ -2781,13 +2882,13 @@ void PlzSetSetPointFloat(const char *setSetPointFloat) {
     errno = 0;
     int intPart = strtol(setSetPointFloat, &endptr, 10);
     if (checkStrtolError(setSetPointFloat, endptr)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
         return;
     }
     errno = 0;
     int decPart = strtol(endptr + 1, &endptr, 10);
     if (checkStrtolError(endptr + 1, endptr)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
         return;
     }
 
@@ -2800,15 +2901,15 @@ void PlzSetSetPointFloat(const char *setSetPointFloat) {
     }
     float setPointFloat = intPart + decPart / 100.0f;
 
-    plzIJson.cmdRes = pala.setSetpoint(setPointFloat, &Plz.SETP);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setSetpoint(setPointFloat, &Plz.SETP);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddFloat("SETP", Plz.SETP);
     }
 }
 
 void PlzSetSetPointUp() {
-    plzIJson.cmdRes = pala.setSetPointUp(&Plz.SETP);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setSetPointUp(&Plz.SETP);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddFloat("SETP", Plz.SETP);
     }
 }
@@ -2818,12 +2919,12 @@ void PlzSetSilentMode(const char *cmd) {
     errno = 0;
     int silentMode = strtol(cmd, &endptr, 10);
     if (checkStrtolError(cmd, endptr)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
         return;
     }
 
-    plzIJson.cmdRes = pala.setSilentMode(silentMode, &Plz.SLNT, &Plz.PWR, &Plz.F2L, &Plz.F2LF, &Plz.isF3LF4LValid, &Plz.F3L, &Plz.F4L);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.setSilentMode(silentMode, &Plz.SLNT, &Plz.PWR, &Plz.F2L, &Plz.F2LF, &Plz.isF3LF4LValid, &Plz.F3L, &Plz.F4L);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddInt("SLNT", Plz.SLNT);
         PlzJSONAddInt("PWR", Plz.PWR);
         PlzJSONAddInt("F2L", Plz.F2L);
@@ -2836,14 +2937,14 @@ void PlzSetSilentMode(const char *cmd) {
 }
 
 void PlzSetSN(const char *cmd) {
-    //plzIJson.cmdRes = pala.setSN(&Plz.SN);
+    //PlzIJson.cmdRes = pala.setSN(&Plz.SN);
     PlzJSONAddStr("SN", "LT201629480580256025776");
-    plzIJson.cmdRes = Palazzetti::CommandResult::OK;
+    PlzIJson.cmdRes = Palazzetti::CommandResult::OK;
 }
 
 void PlzSetSwitchOff() {
-    plzIJson.cmdRes = pala.switchOff(&Plz.STATUS, &Plz.LSTATUS, &Plz.FSTATUS);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.switchOff(&Plz.STATUS, &Plz.LSTATUS, &Plz.FSTATUS);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddInt("STATUS", Plz.STATUS);
         PlzJSONAddInt("LSTATUS", Plz.LSTATUS);
         PlzJSONAddInt("FSTATUS", Plz.FSTATUS);
@@ -2851,8 +2952,8 @@ void PlzSetSwitchOff() {
 }
 
 void PlzSetSwitchOn() {
-    plzIJson.cmdRes = pala.switchOn(&Plz.STATUS, &Plz.LSTATUS, &Plz.FSTATUS);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.switchOn(&Plz.STATUS, &Plz.LSTATUS, &Plz.FSTATUS);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         PlzJSONAddInt("STATUS", Plz.STATUS);
         PlzJSONAddInt("LSTATUS", Plz.LSTATUS);
         PlzJSONAddInt("FSTATUS", Plz.FSTATUS);
@@ -2865,7 +2966,7 @@ void PlzSendParametersResponse(char* fileType, const void* params, size_t paramC
     if (strcmp(fileType, "CSV") == 0 ) {
         char header[50];
         snprintf(header, sizeof(header), "%s;VALUE\r\n", paramType);
-        strncat(plzIJson.data, header, sizeof(plzIJson.data) - strlen(plzIJson.data) - 1);
+        strncat(PlzIJson.data, header, sizeof(PlzIJson.data) - strlen(PlzIJson.data) - 1);
 
         for (size_t i = 0; i < paramCount; i++) {
             PlzJSONAddCSV(String(i).c_str(), ((const byte*)params)[i]);
@@ -2903,13 +3004,13 @@ bool PlzSyscmdCmd(const char* cmd) {
     // Convertir en majuscules
     for (char &c : cmndType) c = toupper(c);
     for (char &c : cmnd) c = toupper(c);
-    plzIJson.success = false;
+    PlzIJson.success = false;
 
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Commande PlzSyscmdCmd cmndType=%s"), cmndType);
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Commande PlzSyscmdCmd cmnd=%s"), cmnd);
 
     if (strcasecmp(cmndType, "SETTZ") == 0) {
-        //plzIJson.success = PlzParserGET(cmnd);
+        //PlzIJson.success = PlzParserGET(cmnd);
     } else if (strcasecmp(cmndType, "SETTZ") == 0) {
     }
     return false;
@@ -2920,8 +3021,8 @@ void PlzWriteData(const char *cmd) {
     errno = 0;
     int hex = strtol(cmd, &endptr1, 16);
     if (checkStrtolError(cmd, endptr1)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing hex value PlzWriteData"));
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing hex value PlzWriteData"));
         return;
     }
 
@@ -2929,8 +3030,8 @@ void PlzWriteData(const char *cmd) {
     errno = 0;
     int value = strtol(endptr1, &endptr2, 10);
     if (checkStrtolError(endptr1, endptr2)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing value PlzWriteData"));
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing value PlzWriteData"));
         return;
     }
 
@@ -2938,15 +3039,15 @@ void PlzWriteData(const char *cmd) {
     errno = 0;
     int mode = strtol(endptr2, &endptr3, 10);
     if (checkStrtolError(endptr2, endptr3)) {
-        plzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
-        snprintf(plzIJson.msg, sizeof(plzIJson.msg), PSTR("Error parsing mode value PlzWriteData"));
+        PlzIJson.cmdRes = Palazzetti::CommandResult::PARSER_ERROR;
+        snprintf(PlzIJson.msg, sizeof(PlzIJson.msg), PSTR("Error parsing mode value PlzWriteData"));
         return;
     }
 
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Commande PlzWriteData hex=%d, value=%d, mode=%d"), hex, value, mode);
     return;
-    plzIJson.cmdRes = pala.writeData(hex, value, mode);
-    if (plzIJson.cmdRes == Palazzetti::CommandResult::OK) {
+    PlzIJson.cmdRes = pala.writeData(hex, value, mode);
+    if (PlzIJson.cmdRes == Palazzetti::CommandResult::OK) {
         char key[10];
         snprintf_P(key, sizeof(key), PSTR("ADDR_%04X"), hex % 0x10000);
         PlzJSONAddStr("DATATYPE", (value > 0 ? "WORD" : "BYTE"));
@@ -2956,7 +3057,6 @@ void PlzWriteData(const char *cmd) {
 
 bool PlzCmd(void) {
     char command[CMDSZ];
-    char subCommand[CMDSZ];
     char *arg_part = NULL;
     char *cmd_part = NULL;
 
@@ -2967,7 +3067,7 @@ bool PlzCmd(void) {
 
         if (XdrvMailbox.data_len > 0) {
             cmd_part = strtok_r(XdrvMailbox.data, " ", &arg_part);
-            AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Cmd mqtt_part=%s"), cmd_part);
+            AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Cmd %s"), cmd_part);
             //AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Cmd arg_part=%s"), arg_part);
 
             uint8_t command_code = GetCommandCode(command, sizeof(command), cmd_part, kPalazzetti_Commands);
@@ -2977,60 +3077,58 @@ bool PlzCmd(void) {
             switch (command_code) {
                 case CMND_PALAZZETTI_SENDMSG:
                     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Sendmsg cmd %s"), arg_part);
-                    if (plzRequest.isConnected && *arg_part != '\0') {
-                        plzRequest.commandData = (char*)malloc(strlen(arg_part) + 1);
-                        if (plzRequest.commandData != nullptr) {
-                            strcpy(plzRequest.commandData, arg_part);
+                    if (PlzRequest.is_connected && *arg_part != '\0') {
+                        PlzRequest.command_data = (char*)malloc(strlen(arg_part) + 1);
+                        if (PlzRequest.command_data != nullptr) {
+                            strcpy(PlzRequest.command_data, arg_part);
                             serviced = PlzParser();
-                            free(plzRequest.commandData);
-                            plzRequest.commandData = nullptr;
+                            free(PlzRequest.command_data);
+                            PlzRequest.command_data = nullptr;
                         } else {
-                            AddLog(LOG_LEVEL_ERROR, PSTR("PLZ: Memory allocation for commandData failed"));
+                            AddLog(LOG_LEVEL_ERROR, PSTR("PLZ: Memory allocation for command_data failed"));
                             //serviced = false;
                         }
                     } else {
                         serviced = true;
                     }
+                    break;
                 case CMND_PALAZZETTI_INIT:
                     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Init cmd"));
-                    PlzInit();
                     serviced = true;
+                    PlzInit();
                     break;
                 case CMND_PALAZZETTI_INTERVAL:
                     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Interval cmd=%s"), arg_part);
-                    if (plzInterval > atoi(arg_part)) {
-                        itoa(plzInterval, arg_part, 10);
+                    if (PlzSettings.interval > atoi(arg_part)) {
+                        itoa(PlzSettings.interval, arg_part, 10);
                     }
-                    PalazzettiSettings.interval = atoi(arg_part);
+                    PlzSettings.interval = atoi(arg_part);
                     PlzSettingsSave();
-                    AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Timesync setting updated to %d"), newSetting);
-                    Response_P(PSTR("{\"TIMESYNC_SETTING_UPDATED\":%d}"), newSetting);  // Réponse en console
-
+                    PlzSettingsPublish();
                     serviced = true;
                     break;
-                case CMND_PALAZZETTI_TIMESYNC:
+                case CMND_PALAZZETTI_SYNCCLOCK:
                     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Timesync cmd"));
                     if (strcmp(arg_part, "0") == 0 || strcmp(arg_part, "off") == 0) {
                         newSetting = 0;  // Désactiver
                     } else if (strcmp(arg_part, "1") == 0 || strcmp(arg_part, "on") == 0) {
                         newSetting = 1;  // Activer
                     }
-                    
+
                     if (newSetting != 255) {
-                        PalazzettiSettings.sync_clock = newSetting;
+                        PlzSettings.sync_clock = newSetting;
                         PlzSettingsSave();  // Sauvegarder les settings mis à jour
-                        AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Timesync setting updated to %d"), newSetting);
-                        Response_P(PSTR("{\"TIMESYNC_SETTING_UPDATED\":%d}"), newSetting);  // Réponse en console
+                        PlzSettingsPublish();
                     } else {
                         AddLog(LOG_LEVEL_ERROR, PSTR("PLZ: Invalid sync_clock argument: %s"), arg_part);
-                        Response_P(PSTR("{\"Error\":\"Invalid sync_clock argument\"}"));
+                        PlzSettingsPublish();
                     }
 
                     serviced = true;
                     break;
                 case CMND_PALAZZETTI_MQTT:
                     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: mqtt"));
-                    
+
                     if (strcmp(arg_part, "0") == 0 || strcmp(arg_part, "raw") == 0) {
                         newSetting = 0;
                     } else if (strcmp(arg_part, "1") == 0 || strcmp(arg_part, "json") == 0) {
@@ -3038,15 +3136,14 @@ bool PlzCmd(void) {
                     } else if (strcmp(arg_part, "2") == 0 || strcmp(arg_part, "rawtopic") == 0) {
                         newSetting = 2;
                     }
-                    
+
                     if (newSetting != 255) {
-                        PalazzettiSettings.mqtt_topic = newSetting;
+                        PlzSettings.mqtt_topic = newSetting;
                         PlzSettingsSave();
-                        AddLog(LOG_LEVEL_INFO, PSTR("PLZ: MQTT setting updated to %d"), newSetting);
-                        Response_P(PSTR("{\"MQTT_SETTING_UPDATED\":%d}"), newSetting);  // Réponse en console
+                        PlzSettingsPublish();
                     } else {
                         AddLog(LOG_LEVEL_ERROR, PSTR("PLZ: Invalid MQTT argument: %s"), arg_part);
-                        Response_P(PSTR("{\"Error\":\"Invalid MQTT argument\"}"));
+                        PlzSettingsPublish();
                     }
                     serviced = true;
                     break;
@@ -3065,21 +3162,22 @@ void PlzDisplayCmdHelp(void) {
     AddLog(LOG_LEVEL_INFO, PSTR("Palazzetti commands :"));
     AddLog(LOG_LEVEL_INFO, PSTR("    sendmsg [GET/SET/CMD/BKP/EXT] [] []   Send commands to Palazzetti"));
     AddLog(LOG_LEVEL_INFO, PSTR("    init                                  Initialize serial connection"));
-    AddLog(LOG_LEVEL_INFO, PSTR("    refresh interval=%d                    Refresh informations interval"), PalazzettiSettings.interval);
-    AddLog(LOG_LEVEL_INFO, PSTR("    sync_clock=%d                       Sync Palazzetti time from Tasmota"), PalazzettiSettings.sync_clock);
-    AddLog(LOG_LEVEL_INFO, PSTR("    mqtt=%d                             MQTT topic usage"), PalazzettiSettings.mqtt_topic);
+    AddLog(LOG_LEVEL_INFO, PSTR("    interval=%d                        Refresh informations interval"), PlzSettings.interval);
+    AddLog(LOG_LEVEL_INFO, PSTR("    sync=%d                            Sync Palazzetti time from Tasmota"), PlzSettings.sync_clock);
+    AddLog(LOG_LEVEL_INFO, PSTR("    mqtt=%d                             MQTT topic usage"), PlzSettings.mqtt_topic);
 }
 
 void PlzSettingsDefault(void) {
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: " D_USE_DEFAULTS));
-    PalazzettiSettings.sync_clock = PLZ_SETTINGS_TIMESYNC;
-    PalazzettiSettings.mqtt_topic = PLZ_SETTINGS_MQTT_TOPIC;
-    PalazzettiSettings.version = PLZ_SETTINGS_VERSION;
+    PlzSettings.sync_clock = PLZ_SETTINGS_TIMESYNC;
+    PlzSettings.mqtt_topic = PLZ_SETTINGS_MQTT_TOPIC;
+    PlzSettings.interval = PLZ_SETTINGS_INTERVAL;
+    PlzSettings.version = PLZ_SETTINGS_VERSION;
 }
 
 bool PlzSettingsRestore(void) {
-    XdrvMailbox.data  = (char*)&PalazzettiSettings;
-    XdrvMailbox.index = sizeof(PalazzettiSettings);
+    XdrvMailbox.data  = (char*)&PlzSettings;
+    XdrvMailbox.index = sizeof(PlzSettings);
     return true;
 }
 
@@ -3087,7 +3185,7 @@ void PlzSettingsLoad(bool erase) {
     // Called from FUNC_PRE_INIT once at restart
     // Called from FUNC_RESET_SETTINGS
 
-    memset(&PalazzettiSettings, 0x00, sizeof(PalazzettiSettings));
+    memset(&PlzSettings, 0x00, sizeof(PlzSettings));
     // Init default values in case file is not found
     PlzSettingsDefault();
 
@@ -3100,11 +3198,11 @@ void PlzSettingsLoad(bool erase) {
 #ifdef USE_UFILESYS
     if (erase) {
         // Use defaults
-        TfsDeleteFile(filename);  
+        TfsDeleteFile(filename);
     }
-    else if (TfsLoadFile(filename, (uint8_t*)&PalazzettiSettings, sizeof(PalazzettiSettings))) {
+    else if (TfsLoadFile(filename, (uint8_t*)&PlzSettings, sizeof(PlzSettings))) {
         // Fix possible setting deltas
-        
+
     } else {
         // File system not ready: No flash space reserved for file system
         AddLog(LOG_LEVEL_INFO, PSTR(D_ERROR_FILE_NOT_FOUND));
@@ -3116,17 +3214,17 @@ void PlzSettingsLoad(bool erase) {
 
 void PlzSettingsSave(void) {
   // Called from FUNC_SAVE_SETTINGS every SaveData second and at restart
-  uint32_t crc32 = GetCfgCrc32((uint8_t*)&PalazzettiSettings +4, sizeof(PalazzettiSettings) -4);  // Skip crc32
-  if (crc32 != PalazzettiSettings.crc32 && PalazzettiSettings.version > 0) {
-    PalazzettiSettings.crc32 = crc32;
-    
+  uint32_t crc32 = GetCfgCrc32((uint8_t*)&PlzSettings +4, sizeof(PlzSettings) -4);  // Skip crc32
+  if (crc32 != PlzSettings.crc32 && PlzSettings.version > 0) {
+    PlzSettings.crc32 = crc32;
+
     char filename[20];
     snprintf_P(filename, sizeof(filename), PSTR(TASM_FILE_DRIVER), XDRV_74);
 
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: About to save settings to file %s"), filename);
 
 #ifdef USE_UFILESYS
-    if (!TfsSaveFile(filename, (const uint8_t*)&PalazzettiSettings, sizeof(PalazzettiSettings))) {
+    if (!TfsSaveFile(filename, (const uint8_t*)&PlzSettings, sizeof(PlzSettings))) {
         // File system not ready: No flash space reserved for file system
         AddLog(LOG_LEVEL_INFO, D_ERROR_FILE_NOT_FOUND);
     }
@@ -3134,6 +3232,16 @@ void PlzSettingsSave(void) {
     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Error, file system not enabled"));
 #endif  // USE_UFILESYS
     }
+}
+
+void PlzSettingsPublish(void) {
+	Response_P(PSTR("{\"SyncClock\":\"%s\""), PlzSettings.sync_clock ? "on" : "off");
+    const char *topic = PlzSettings.mqtt_topic == 0 ? "raw" : PlzSettings.mqtt_topic == 1 ? "json" : PlzSettings.mqtt_topic == 2 ? "rawtopic" : "N/A";
+	ResponseAppend_P(PSTR(",\"MQTTTopicName\":\"%s\""), topic);
+	ResponseAppend_P(PSTR(",\"MQTTTopic\":%d"), PlzSettings.mqtt_topic);
+	ResponseAppend_P(PSTR(",\"Interval\":%d"), PlzSettings.interval);
+	ResponseAppend_P(PSTR(",\"Version\":%d}"), PlzSettings.version);
+	MqttPublishPrefixTopicRulesProcess_P(TELE, PSTR("PlzSettings"));
 }
 
 // Initialisation
@@ -3145,39 +3253,48 @@ bool Xdrv74(uint32_t function) {
             PlzInit();  // Initialiser le contrôle
             break;
         case FUNC_SAVE_BEFORE_RESTART:
-            if (plzRequest.isConnected) { PlzSaveBeforeRestart(); }
+            if (PlzRequest.is_connected) { PlzSaveBeforeRestart(); }
             break;
         case FUNC_RESTORE_SETTINGS:
             result = PlzSettingsRestore();
             break;
         case FUNC_RESET_SETTINGS:
-            //PlzSettingsLoad(1);
+            PlzSettingsLoad(1);
             break;
         case FUNC_SAVE_SETTINGS:
-            //PlzSettingsSave();
+            PlzSettingsSave();
+            break;
+        case FUNC_AFTER_TELEPERIOD:
+            PlzSettingsPublish();
             break;
         case FUNC_PRE_INIT:
-            //PlzSettingsLoad(0);
+            PlzSettingsLoad(0);
             PlzDrvInit();
-            break; 
+            break;
         case FUNC_EVERY_SECOND:
-            if (plzRequest.isConnected) {
+            if (PlzRequest.is_connected) {
                 PlzUpdate();
                 PlzHandleUdpRequest();
-            } else if (pala_rx_pin == NOT_A_PIN) {
+                if (PlzSettings.sync_clock && RtcTime.valid && Plz.STOVE_DATETIME[0] != '\0') {
+                    PlzSyncClockWithStove();
+                }
+            } else {
                 unsigned long currentTime = millis();
-                if (currentTime - lastAttemptTime >= retryInterval) {
+                if (currentTime - PlzRequest.last_attempt >= PlzRequest.retry_interval) {
                     AddLog(LOG_LEVEL_INFO, PSTR("PLZ: Tentative de reconnexion..."));
                     PlzInit();
-                    lastAttemptTime = currentTime;
+                    PlzRequest.last_attempt = currentTime;
                 }
             }
             break;
         case FUNC_COMMAND:
             result = PlzCmd();
             break;
-        case FUNC_JSON_APPEND:
-            if (plzRequest.isConnected) { PlzShow(1); }
+        /*case FUNC_JSON_APPEND:
+            if (PlzRequest.is_connected) { PlzShow(1); }
+            break;*/
+        case FUNC_SET_DEVICE_POWER:
+            PlzSetPowerBtn();
             break;
     #ifdef USE_WEBSERVER
         case FUNC_WEB_ADD_HANDLER:
@@ -3188,10 +3305,13 @@ bool Xdrv74(uint32_t function) {
         case FUNC_WEB_GET_ARG:
             PlzSendmsgGetRequestHandler();
             break;
-        case FUNC_WEB_SENSOR:
-            if (plzRequest.isConnected) { PlzShow(0); }
+        case FUNC_WEB_SENSOR: // maybe to display last command sent
+            if (PlzRequest.is_connected) { PlzShow(0); }
             break;
     #endif  // USE_WEBSERVER
+        case FUNC_ACTIVE:
+            result = true;
+            break;
     }
     return result;
 }
